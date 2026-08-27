@@ -2,9 +2,9 @@
 
 # ⚡ Cachey
 
-### A distributed key-value cache store, written in Go
+### A **distributed** key-value cache store, written in Go
 
-*Building toward Raft-based consensus and sharding — one solid step at a time.*
+*Raft-based consensus. Sharding. Built for the cluster, not just the box.*
 
 `Go 1.26.7` · `Experimental` · [License](LICENSE)
 
@@ -14,19 +14,24 @@
 
 ## 🌱 Overview
 
+Cachey is a **distributed key-value cache store**. The long-term goal
+is a cluster of nodes that replicate and shard data across machines —
+not just a fast local cache on a single box.
+
 The current implementation is the **first single-node foundation**: an
 in-memory store exposed over TCP with newline-delimited JSON (NDJSON)
-request and response framing.
-
-This project will grow these primitives, step by step, into a
-**replicated, sharded** key-value store.
+request and response framing. This is the base layer everything
+distributed will be built on top of — step by step, this single node
+grows into a **replicated, sharded** cluster.
 
 <br>
 
 ## 🎯 Vision
 
-Cachey is designed to evolve from a local in-memory store into a
-distributed cache with these core properties:
+At its core, Cachey is about **distribution** — spreading data and load
+across many machines instead of relying on one. It's designed to evolve
+from a local in-memory store into a full distributed cache with these
+core properties:
 
 | | Property | Description |
 |---|---|---|
@@ -56,7 +61,7 @@ distributed cache with these core properties:
 ### Install
 
 ```sh
-go install github.com/Sephy314/Cachey/cmd/cacheyd@latest
+go install github.com/Sephy314/Cachey@latest
 ```
 
 This installs the `cacheyd` binary to your `$GOPATH/bin` (or `$GOBIN`) —
@@ -119,7 +124,11 @@ framing automatically.
 
 ## 🏗️ Architecture
 
-### Foundation
+Cachey's architecture is built around one question: **how does a
+single node become a distributed cluster?** The diagrams below show
+where things stand today, and where the distributed design is headed.
+
+### Foundation (single node, today)
 
 ```text
 Client
@@ -137,7 +146,7 @@ Server ──▶ Handler ──▶ Store ──▶ In-memory map
 | `pkg/client` | Provides a small TCP client |
 | `cmd/cacheyd` | Starts the server |
 
-### Target Distributed Architecture
+### Target Distributed Architecture (the goal)
 
 ```text
                               Client
@@ -172,30 +181,6 @@ a single-node in-memory map already provides distributed guarantees.
 | Run the full test suite | `go test ./...` |
 | Run static analysis | `go vet ./...` |
 | Format Go files | `gofmt -w .` |
-
-<br>
-
-## 🗺️ Roadmap
-
-The roadmap follows the target architecture, keeping each step testable.
-
-- [x] **1.** Harden the single-node storage and wire protocol
-- [ ] **2.** Add persistent log and snapshot primitives
-- [ ] **3.** Add node-to-node communication and cluster membership
-- [ ] **4.** Implement Raft leader election, log replication, and recovery
-- [ ] **5.** Turn each Raft group into a replicated shard
-- [ ] **6.** Add key routing, shard rebalancing, and failure handling
-- [ ] **7.** Add TTL/expiration, benchmarks, and operational tooling
-
-<br>
-
-## ⚠️ Project Status
-
-Cachey is an **experimental learning project** working toward a
-Raft-replicated, sharded distributed KV cache. The storage model and
-wire protocol may change significantly as the architecture evolves.
-
-**It is not intended for production use.**
 
 <br>
 
