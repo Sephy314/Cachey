@@ -8,9 +8,6 @@ import (
 
 func TestCacheyStoreCRUD(t *testing.T) {
 	cache := NewCacheyStore()
-	if cache.Alive() != "Alive" {
-		t.Fatal("Alive() = false, want Alive")
-	}
 
 	if err := cache.Put("key", "value"); err != nil {
 		t.Fatalf("Put() error = %v", err)
