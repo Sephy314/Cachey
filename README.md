@@ -174,9 +174,9 @@ a single-node in-memory map already provides distributed guarantees.
 
 ## � Durability & WAL Persistence
 
-> **Status:** design (v10). The WAL durability layer is the next
-> planned foundation for making a single node crash-safe before it
-> becomes a replicated one.
+> **Status:** implemented (v1). Active WAL + temporary WAL + snapshot,
+> with a single writer goroutine and a background sealing/rotation
+> manager. Run `cacheyd <addr> <data-dir>` to enable durability.
 
 Cachey's durability layer is a **WAL (Write-Ahead Log)** built for
 crash recovery. The correctness bar is not "a file appears after PUT"
@@ -289,7 +289,7 @@ WAL has its own explicit limit, applying backpressure when full.
 
 - **Bootstrap** (no snapshot, no WALs) — empty store, `next_log_index = 1`
 - **Partial write** — an incomplete trailing record is truncated; invalid JSON in the middle of the file is corruption (fail-fast)
-- **Continuity check** — `snapshot.last_log_index = N` must be followed by WAL index `N+1`; gaps or duplicates fail-fast
+- **Continuity check** — replay enforces strictly increasing indices; a gap is corruption (fail-fast), while records already covered by the snapshot (left on disk by a crash during sealing) are replayed idempotently (last write wins)
 - **Case A** (crash mid-sealing) — replay snapshot + both WALs, then rebuild them into one active WAL via `wal.ndjson.rebuild.tmp` + fsync + rename
 - **Case B** (crash after snapshot, before rotation) — replay snapshot + WAL idempotently (last write wins)
 - **Case C** (stray temporary WAL) — defensive check; a valid temporary WAL is verified and restored as the active WAL
