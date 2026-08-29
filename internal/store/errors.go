@@ -1,9 +1,13 @@
 package store
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/Sephy314/Cachey/internal/protocol"
+)
 
 var (
 	ErrorCodeInvalidCommand = errors.New("invalid command")
-	ErrorCodeInvalidKey     = errors.New("invalid key")
+	ErrorCodeInvalidKey     = protocol.Statusf(protocol.CodeNotFound, "invalid key")
 	ErrorCodeInvalidValue   = errors.New("invalid value")
 )

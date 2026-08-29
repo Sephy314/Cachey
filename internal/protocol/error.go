@@ -3,7 +3,7 @@ package protocol
 import "errors"
 
 var (
-	ErrorCodeInvalidCommand = errors.New("invalid command")
+	ErrorCodeInvalidCommand = Statusf(CodeInvalidArgument, "invalid command")
 	ErrorCodeInvalidKey     = errors.New("invalid key")
 	ErrorCodeInvalidValue   = errors.New("invalid value")
 )

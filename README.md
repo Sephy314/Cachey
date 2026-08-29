@@ -117,8 +117,21 @@ is one JSON object followed by a newline.
 </tr>
 </table>
 
-The Go client in `pkg/client` handles JSON serialization and newline
-framing automatically.
+Failed commands are never dropped — the server replies with a
+gRPC-style status object instead:
+
+```json
+{"code":5,"message":"invalid key"}
+```
+
+| `code` | gRPC name | Meaning |
+|---|---|---|
+| `3` | `InvalidArgument` | Malformed request |
+| `5` | `NotFound` | Missing key |
+| `12` | `Unimplemented` | Unknown command |
+
+The Go client in `pkg/client` handles JSON serialization, newline
+framing, and status errors automatically.
 
 <br>
 

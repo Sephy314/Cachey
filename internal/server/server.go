@@ -67,7 +67,9 @@ func (s *Server) Start() error {
 							"Error handling request: %v",
 							err,
 						)
-						continue
+						// Reply with a gRPC-style status instead of dropping
+						// the request so clients never wait forever.
+						resp = statusBytes(err)
 					}
 
 					if _, err := conn.Write(append(resp, '\n')); err != nil {
