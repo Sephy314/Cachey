@@ -83,7 +83,7 @@ func TestServerProcessesAliveCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeSerializeCommand() error = %v", err)
 	}
-	if got.Val != "true" {
-		t.Fatalf("response = %#v, want Val=true", got)
+	if got.Val != "ALIVE" {
+		t.Fatalf("response = %#v, want Val=ALIVE", got)
 	}
 }
