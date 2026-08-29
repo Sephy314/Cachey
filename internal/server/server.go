@@ -13,6 +13,10 @@ type Server struct {
 	hdlr Handler
 }
 
+type HandlerInterface interface {
+	HandleRequest(data []byte) ([]byte, error)
+}
+
 func NewServer(addr string, hdlr Handler) *Server {
 	return &Server{
 		addr: addr,

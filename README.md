@@ -178,9 +178,26 @@ a single-node in-memory map already provides distributed guarantees.
 
 | Task | Command |
 |---|---|
-| Run the full test suite | `go test ./...` |
-| Run static analysis | `go vet ./...` |
-| Format Go files | `gofmt -w .` |
+| Run the full test suite | `make test` |
+| Run static analysis | `make vet` |
+| Run tests and static analysis | `make check` |
+| Run the race detector | `make race` |
+| Format Go files | `make fmt` |
+| Build the agent harness | `make build-harness` |
+
+### AI Coding-Agent Harness
+
+The `harness run` command drives a configured external coding agent through a
+bounded task, verification, and feedback loop. Update the task in
+[.harness/tasks/current.md](.harness/tasks/current.md), configure the agent and
+allowed verification commands in [.harness/config.toml](.harness/config.toml),
+then run:
+
+```sh
+go run ./cmd/harness run
+```
+
+The harness does not commit, push, reset, or discard repository changes.
 
 <br>
 

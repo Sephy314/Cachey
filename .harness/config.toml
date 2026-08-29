@@ -1,0 +1,15 @@
+[agent]
+command = "copilot"
+args = ["--prompt"]
+
+[test]
+commands = [
+  "go test ./...",
+  "go vet ./..."
+]
+
+[git]
+enabled = true
+
+[loop]
+max_iterations = 5
