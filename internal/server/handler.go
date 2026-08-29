@@ -50,6 +50,17 @@ func (h *CacheyHandler) HandleRequest(data []byte) ([]byte, error) {
 			log.Default().Printf("Error deleting key %s: %v", cmd.Key, err)
 			return nil, err
 		}
+
+	case protocol.TTL:
+		err := h.store.TTL(cmd.Key, cmd.TTL)
+		if err != nil {
+			log.Default().Printf("Error setting TTL for key %s: %v", cmd.Key, err)
+			return nil, err
+		}
+
+	case protocol.ALV:
+		cmd.Val = h.store.Alive()
+
 	default:
 		log.Default().Printf("Invalid command type: %s", cmd.Type)
 		return nil, ErrorCodeInvalidCommand

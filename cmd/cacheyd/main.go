@@ -2,6 +2,8 @@ package main
 
 import (
 	"os"
+	"time"
+
 	"github.com/Sephy314/Cachey/internal/server"
 	"github.com/Sephy314/Cachey/internal/store"
 )
@@ -13,8 +15,9 @@ func main() {
 	}
 
 	addr := os.Args[1]
-	
+
 	store := store.NewCacheyStore()
+	store.StartActiveExpiration(1 * time.Second)
 	hdl := server.NewCacheyHandler(store)
 	server := server.NewServer(addr, hdl)
 
