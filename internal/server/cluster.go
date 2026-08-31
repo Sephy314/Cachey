@@ -16,12 +16,12 @@ const proposeTimeout = 5 * time.Second
 
 // ClusterStore is a store.Store whose mutations are replicated through a Raft
 // node and applied to the local FSM (store.CacheyStore) when committed. Reads
-// are served from the local FSM (upgraded to linearizable reads in a later
-// milestone). Writes must be sent to the leader; followers fail with
-// raft.ErrNotLeader and the caller can redirect.
+// are linearizable (read-index protocol). Writes must be sent to the leader;
+// followers fail with raft.ErrNotLeader and the caller can redirect.
 type ClusterStore struct {
-	node *raft.Node
-	fsm  store.Store
+	node   *raft.Node
+	fsm    store.Store
+	addrOf func(string) string // leader node ID → client address (redirects)
 }
 
 // NewClusterStore wraps a raft node as a store.Store. The node's applyFn must
@@ -29,6 +29,10 @@ type ClusterStore struct {
 func NewClusterStore(node *raft.Node, fsm store.Store) *ClusterStore {
 	return &ClusterStore{node: node, fsm: fsm}
 }
+
+// SetLeaderResolver maps a leader node ID to its client address, used for
+// redirect hints.
+func (c *ClusterStore) SetLeaderResolver(fn func(string) string) { c.addrOf = fn }
 
 // NewRaftApply builds the applyFn that decodes a committed entry (a wal.Record
 // payload) into fsm.ApplyRecord. Store apply errors such as a missing key on
@@ -61,6 +65,13 @@ func (c *ClusterStore) propose(rec wal.Record) error {
 }
 
 func (c *ClusterStore) Get(key string) (*string, error) {
+	// Linearizable read: confirm leadership and that the FSM has applied
+	// through the current commit index, then read locally (Raft §6.4).
+	ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
+	defer cancel()
+	if _, err := c.node.ReadIndex(ctx); err != nil {
+		return nil, err
+	}
 	return c.fsm.Get(key)
 }
 
@@ -78,3 +89,12 @@ func (c *ClusterStore) TTL(key string, ttlMillis int64) error {
 }
 
 func (c *ClusterStore) Alive() string { return c.fsm.Alive() }
+
+// Leader returns the current leader's client address ("" if this node is the
+// leader, no leader is known, or no resolver is configured).
+func (c *ClusterStore) Leader() string {
+	if c.addrOf == nil {
+		return ""
+	}
+	return c.addrOf(c.node.Leader())
+}

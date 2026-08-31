@@ -67,6 +67,7 @@ type Node struct {
 	commitIndex uint64
 	lastApplied uint64
 	leaderID    string
+	noopIndex   uint64 // index of the leadership no-op (0 until elected)
 
 	// leader volatile state (Raft §5.4)
 	nextIndex  map[string]uint64
@@ -310,6 +311,7 @@ func (n *Node) tryBecomeLeader(term uint64) bool {
 	}
 	n.role = RoleLeader
 	n.leaderID = n.id
+	n.noopIndex = noopIdx
 	for _, p := range n.peers {
 		n.nextIndex[p] = n.log.lastIndex() + 1
 		n.matchIndex[p] = 0
@@ -328,7 +330,9 @@ func (n *Node) stepDownLocked(term uint64) {
 	n.role = RoleFollower
 	n.votedFor = ""
 	n.leaderID = ""
+	n.noopIndex = 0
 	n.notifyRoleLocked()
+	n.commitCond.Broadcast() // wake any reader waiting on the no-op
 }
 
 func (n *Node) notifyRoleLocked() {

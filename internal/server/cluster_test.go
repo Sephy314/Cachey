@@ -1,13 +1,16 @@
 package server
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Sephy314/Cachey/internal/protocol"
 	"github.com/Sephy314/Cachey/internal/raft"
 	"github.com/Sephy314/Cachey/internal/store"
 	"github.com/Sephy314/Cachey/internal/wal"
+	"github.com/Sephy314/Cachey/pkg/client"
 )
 
 // clusterNode bundles one node's store (FSM), raft node, transport, WAL, and
@@ -82,7 +85,9 @@ func newPersistentNode(t *testing.T, id, dir string, tr *raft.TCPTransport, addr
 	n.SetLogStore(raft.NewWALLogStore(w))
 	tr.SetNode(n)
 	tr.SetPeers(peerAddrsOf(id, addrs))
-	return &clusterNode{id: id, dir: dir, store: st, node: n, tr: tr, wal: w, cs: NewClusterStore(n, st)}
+	cs := NewClusterStore(n, st)
+	cs.SetLeaderResolver(func(leaderID string) string { return addrs[leaderID] })
+	return &clusterNode{id: id, dir: dir, store: st, node: n, tr: tr, wal: w, cs: cs}
 }
 
 func otherIDs(id string, addrs map[string]string) []string {
@@ -256,4 +261,76 @@ func TestPersistentClusterRestart(t *testing.T) {
 		v, err := pc.nodes[victim].store.Get("k1")
 		return err == nil && *v == "v1"
 	})
+}
+
+func TestClusterLinearizableReadAndRedirect(t *testing.T) {
+	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir()}
+	pc := newPersistentCluster(t, []string{"a", "b", "c"}, dirs)
+	defer pc.stopAll()
+
+	// Start a client-facing server per node; redirects point at the leader's
+	// client address.
+	clientAddrs := map[string]string{}
+	servers := map[string]*Server{}
+	for id, cn := range pc.nodes {
+		srv := NewServer("127.0.0.1:0", NewCacheyHandler(cn.cs))
+		if err := srv.Start(); err != nil {
+			t.Fatalf("start client server %s: %v", id, err)
+		}
+		clientAddrs[id] = srv.Addr()
+		servers[id] = srv
+	}
+	defer func() {
+		for _, s := range servers {
+			s.Stop()
+		}
+	}()
+	for _, cn := range pc.nodes {
+		cn.cs.SetLeaderResolver(func(leaderID string) string { return clientAddrs[leaderID] })
+	}
+
+	pc.write(t, "k1", "v1")
+	leader := pc.waitLeader(t)
+
+	// Linearizable read on the leader via the client protocol.
+	lc, err := client.NewClient(clientAddrs[leader])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	resp, err := lc.SendCommand(protocol.Command{Type: protocol.GET, Key: "k1"})
+	if err != nil || resp == nil || *resp == "" {
+		t.Fatalf("leader GET k1: resp=%v err=%v", resp, err)
+	}
+
+	// A write to a follower is rejected with a redirect to the leader's
+	// client address.
+	var follower string
+	for id := range pc.nodes {
+		if id != leader {
+			follower = id
+			break
+		}
+	}
+	fc, err := client.NewClient(clientAddrs[follower])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fc.Close()
+	_, err = fc.SendCommand(protocol.Command{Type: protocol.GET, Key: "k1"})
+	addr, ok := client.RedirectLeader(err)
+	if !ok {
+		t.Fatalf("follower GET: expected a redirect error, got %v", err)
+	}
+	if addr != clientAddrs[leader] {
+		t.Fatalf("redirect leader = %q, want %q", addr, clientAddrs[leader])
+	}
+
+	// The follower's ClusterStore surfaces the same redirect on reads/writes.
+	if _, err := pc.nodes[follower].cs.Get("k1"); !errors.Is(err, raft.ErrNotLeader) {
+		t.Fatalf("follower cs.Get: want raft.ErrNotLeader, got %v", err)
+	}
+	if err := pc.nodes[follower].cs.Put("k2", "v2"); !errors.Is(err, raft.ErrNotLeader) {
+		t.Fatalf("follower cs.Put: want raft.ErrNotLeader, got %v", err)
+	}
 }

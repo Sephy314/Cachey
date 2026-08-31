@@ -99,3 +99,11 @@ func (s *Server) Stop() error {
 	}
 	return nil
 }
+
+// Addr returns the bound listen address ("" before Start or if not listening).
+func (s *Server) Addr() string {
+	if s.ln != nil {
+		return s.ln.Addr().String()
+	}
+	return ""
+}
