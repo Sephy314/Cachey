@@ -3,7 +3,6 @@ package protocol
 import (
 	"encoding/json"
 	"log"
-
 )
 
 func DeSerializeCommand(data []byte) (*Command, error) {
@@ -23,7 +22,7 @@ func DeSerializeCommand(data []byte) (*Command, error) {
 	return &cmd, nil
 
 }
-	
+
 func (cmd *Command) Serialize() ([]byte, error) {
 	// data: {"command":"FOO", "key":"bar", "val":"baz"}
 	data, err := json.Marshal(cmd)
@@ -32,4 +31,3 @@ func (cmd *Command) Serialize() ([]byte, error) {
 	}
 	return data, nil
 }
-

@@ -117,8 +117,21 @@ is one JSON object followed by a newline.
 </tr>
 </table>
 
-The Go client in `pkg/client` handles JSON serialization and newline
-framing automatically.
+Failed commands are never dropped — the server replies with a
+gRPC-style status object instead:
+
+```json
+{"code":5,"message":"invalid key"}
+```
+
+| `code` | gRPC name | Meaning |
+|---|---|---|
+| `3` | `InvalidArgument` | Malformed request |
+| `5` | `NotFound` | Missing key |
+| `12` | `Unimplemented` | Unknown command |
+
+The Go client in `pkg/client` handles JSON serialization, newline
+framing, and status errors automatically.
 
 <br>
 
@@ -172,7 +185,136 @@ a single-node in-memory map already provides distributed guarantees.
 
 <br>
 
-## 🛠️ Development
+## � Durability & WAL Persistence
+
+> **Status:** implemented (v1). Active WAL + temporary WAL + snapshot,
+> with a single writer goroutine and a background sealing/rotation
+> manager. Run `cacheyd <addr> <data-dir>` to enable durability.
+
+Cachey's durability layer is a **WAL (Write-Ahead Log)** built for
+crash recovery. The correctness bar is not "a file appears after PUT"
+but:
+
+```
+PUT
+ ↓
+WAL durable
+ ↓
+success
+
+Crash
+ ↓
+Recovery
+ ↓
+Snapshot + WAL
+ ↓
+Same state restored
+```
+
+The WAL is a durability layer for recovery — it is *not* a long-term
+history store of the database.
+
+### Architecture
+
+```text
+                 ┌──────────────┐
+PUT ───────────► │     DML      │
+                 └──────┬───────┘
+                        │ Mutation
+                        ▼
+                 ┌──────────────┐
+                 │    Logger    │  Logical WAL
+                 └──────┬───────┘
+                        │ Mutation / Control
+                        ▼
+                 ┌──────────────┐
+                 │  WAL Channel │  Bounded
+                 └──────┬───────┘
+                        │
+                        ▼
+                 ┌──────────────┐
+                 │  WAL Writer  │  Single writer
+                 └──────┬───────┘
+             ┌──────────┴──────────┐
+             ▼                     ▼
+      wal.ndjson             wal.tmp.ndjson
+       Active WAL             Temporary WAL
+
+                 ┌──────────────┐
+                 │  WAL Manager │  Background
+                 └──────┬───────┘
+                        │ Control message
+                        ▼
+                   WAL Channel
+```
+
+- **Logger** — issues logical WAL record requests
+- **WAL Writer** — the only goroutine that performs WAL file I/O; appends are always serialized
+- **WAL Manager** — observes file state and drives sealing, snapshots, and rotation in the background
+
+### Key invariants
+
+1. **Single Writer** — one writer goroutine appends to every WAL file
+2. **Ordering** — `log_index order = append order = durability order`
+3. **Serialized Control** — mutations and control messages share one FIFO WAL channel
+4. **WAL is Source of Truth** — the actual WAL file always wins over in-memory metadata
+5. **Metadata is Volatile** — an in-memory cache, rebuilt during recovery
+6. **Durability Contract** — a successful mutation is durable per the durability policy
+7. **Index Continuity** — no gaps or duplicates in a healthy WAL
+8. **Snapshot Boundary** — snapshots only cover up to a confirmed WAL boundary
+9. **Atomic Snapshot Replace** — temp file + fsync + rename
+10. **Atomic WAL Rotation** — temporary WAL becomes active via an atomic rename
+11. **Directory Durability** — directory fsync after rename/unlink
+12. **No Direct Manager Mutation** — the manager never mutates writer state directly
+13. **Serialized Control Transition** — all writer state transitions go through the WAL channel
+14. **Idempotent Control** — retrying the same control ID returns the same result, answered on the latest request's ack channel
+15. **Non-Blocking Response** — `ResultCh` and `AckCh` are buffered (capacity 1); a vanished receiver never blocks the sender
+16. **Bounded Memory** — WAL channel, hold queue, and temporary WAL never grow unbounded
+17. **Crash Recoverability** — every intermediate crash state is decidable at startup recovery
+
+### Durability policy
+
+The initial implementation uses **synchronous fsync per mutation** —
+simple and correct. A failed append or fsync is not reported as
+successful, and the temporary WAL applies the same policy.
+
+> **Future:** if benchmarks show a throughput ceiling, a **group
+> commit** that batches writes before a single fsync can be introduced —
+> while preserving index/append/durability ordering.
+
+### Rotation lifecycle
+
+```text
+IDLE ──(StartSealing)──► SEALING ──(Snapshot)──► ROTATING ──(RotationComplete)──► IDLE
+```
+
+1. When the active WAL's metadata count approaches ~2,000 records, the manager sends `StartSealing`; the writer confirms a boundary index and switches new appends to `wal.tmp.ndjson`.
+2. The manager writes a snapshot to `snapshot.tmp`, fsyncs, then atomically renames it to `snapshot` (followed by a directory fsync).
+3. The manager sends `FinishRotation`; the writer stops appending to the temporary WAL and acks the last index.
+4. The manager renames `wal.tmp.ndjson` → `wal.ndjson` (atomic in POSIX), then directory fsync.
+5. The manager sends `RotationComplete`; the writer returns to `ACTIVE` and drains its hold queue before consuming new channel items.
+
+Failures retry with exponential backoff; exceeding the retry limit exits
+the process so startup recovery re-evaluates disk state. The temporary
+WAL has its own explicit limit, applying backpressure when full.
+
+### Recovery
+
+- **Bootstrap** (no snapshot, no WALs) — empty store, `next_log_index = 1`
+- **Partial write** — an incomplete trailing record is truncated; invalid JSON in the middle of the file is corruption (fail-fast)
+- **Continuity check** — replay enforces strictly increasing indices; a gap is corruption (fail-fast), while records already covered by the snapshot (left on disk by a crash during sealing) are replayed idempotently (last write wins)
+- **Case A** (crash mid-sealing) — replay snapshot + both WALs, then rebuild them into one active WAL via `wal.ndjson.rebuild.tmp` + fsync + rename
+- **Case B** (crash after snapshot, before rotation) — replay snapshot + WAL idempotently (last write wins)
+- **Case C** (stray temporary WAL) — defensive check; a valid temporary WAL is verified and restored as the active WAL
+- **`snapshot.tmp`** — never trusted as a completed snapshot; discarded when a complete `snapshot` exists
+
+### Implementation order
+
+`WALRecord`/`log_index` → WAL Writer → bounded WAL channel → mutation + buffered `ResultCh` → synchronous fsync → WAL Manager → `StartSealing` + buffered ack + idempotency → atomic snapshot → temporary WAL + hold queue → `FinishRotation` → atomic rename + directory fsync → `RotationComplete` → retry/backoff → crash recovery → partial-WAL recovery → continuity validation → failure/stress tests.
+
+<br>
+
+## �🛠️ Development
 
 *For contributors working from a cloned copy of the repo:*
 

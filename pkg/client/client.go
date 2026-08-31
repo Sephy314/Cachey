@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"encoding/json"
 	"net"
 	"strings"
 
@@ -26,19 +27,22 @@ func (c *Client) SendCommand(cmd protocol.Command) (*string, error) {
 		return nil, err
 	}
 	data = append(data, '\n')
-	_, err = c.conn.Write(data)
-	if err != nil {
+	if _, err := c.conn.Write(data); err != nil {
 		return nil, err
 	}
 
-	reader := bufio.NewReader(c.conn)
-	response, err := reader.ReadString('\n')
-
+	response, err := bufio.NewReader(c.conn).ReadString('\n')
 	if err != nil && err.Error() != "EOF" {
 		return nil, err
 	}
-
 	response = strings.TrimSpace(response)
+
+	// A gRPC-style status response (e.g. {"code":5,"message":"..."}) means the
+	// command failed; command responses never carry a non-zero code.
+	var st protocol.Status
+	if json.Unmarshal([]byte(response), &st) == nil && st.Code != 0 {
+		return nil, &st
+	}
 	return &response, nil
 }
 
