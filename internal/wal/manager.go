@@ -34,6 +34,9 @@ type Manager struct {
 
 	nextID   ControlID
 	rotating bool
+
+	// disableRotation suppresses the rotation manager (raft-log mode).
+	disableRotation bool
 }
 
 func newManager(cfg Config, w *Writer, ch chan any, snapshotFn func() ([]SnapshotEntry, error)) *Manager {
@@ -67,6 +70,7 @@ func newManager(cfg Config, w *Writer, ch chan any, snapshotFn func() ([]Snapsho
 	if m.threshold <= 0 {
 		m.threshold = 2000
 	}
+	m.disableRotation = cfg.DisableRotation
 	return m
 }
 
@@ -85,6 +89,9 @@ func (m *Manager) run() {
 }
 
 func (m *Manager) tick() {
+	if m.disableRotation {
+		return
+	}
 	if m.rotating || m.writer.MetaCount() < m.threshold {
 		return
 	}

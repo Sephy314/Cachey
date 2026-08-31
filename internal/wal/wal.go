@@ -11,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -34,16 +35,26 @@ const (
 	OpPut    Op = "PUT"
 	OpDelete Op = "DEL"
 	OpTTL    Op = "TTL"
+	// OpNoop marks a Raft no-op entry (committed to advance the commit index);
+	// it carries no state change.
+	OpNoop Op = "NOOP"
 )
 
 // Record is a single logical WAL entry. LogIndex is assigned by the writer in
 // append order and must be strictly increasing.
+//
+// Term and RaftIndex are set when the WAL is used as the persistence backend
+// for the Raft replicated log: Term is the entry's Raft term and RaftIndex is
+// its index in the Raft log (which may repeat after a Raft truncation). They
+// are ignored by the store's FSM apply.
 type Record struct {
-	Op       Op     `json:"op"`
-	Key      string `json:"key"`
-	Val      string `json:"val,omitempty"`
-	Exp      int64  `json:"exp,omitempty"` // absolute Unix-ms expiry (TTL op)
-	LogIndex uint64 `json:"log_index"`
+	Op        Op     `json:"op"`
+	Key       string `json:"key"`
+	Val       string `json:"val,omitempty"`
+	Exp       int64  `json:"exp,omitempty"` // absolute Unix-ms expiry (TTL op)
+	LogIndex  uint64 `json:"log_index"`
+	Term      uint64 `json:"term,omitempty"`       // raft term (raft log entries)
+	RaftIndex uint64 `json:"raft_index,omitempty"` // raft log index (raft log entries)
 }
 
 // marshal serializes a record as one NDJSON line (including trailing newline).
@@ -113,6 +124,10 @@ type Config struct {
 	CheckInterval time.Duration
 	AckTimeout    time.Duration
 	MaxRetries    int
+	// DisableRotation turns off the background sealing/snapshot/rotation
+	// manager. Used when the WAL backs the Raft log, where compaction must
+	// wait until snapshot/InstallSnapshot support exists.
+	DisableRotation bool
 }
 
 // DefaultConfig returns production defaults for a WAL rooted at dir.
@@ -156,11 +171,12 @@ func (l Logger) Append(ctx context.Context, rec Record) error {
 // WAL is a running write-ahead log: a writer goroutine (durability), a manager
 // goroutine (sealing/snapshot/rotation), and the bounded channel between them.
 type WAL struct {
-	dir     string
-	ch      chan any
-	logger  Logger
-	writer  *Writer
-	manager *Manager
+	dir       string
+	ch        chan any
+	logger    Logger
+	writer    *Writer
+	manager   *Manager
+	closeOnce sync.Once
 }
 
 // Open runs recovery, starts the writer and manager goroutines, and returns a
@@ -222,11 +238,15 @@ func (w *WAL) Append(ctx context.Context, rec Record) error {
 // MetaCount is an approximate count of records in the current active WAL.
 func (w *WAL) MetaCount() int64 { return w.writer.MetaCount() }
 
-// Close stops the manager and writer goroutines and closes open files.
+// Close stops the manager and writer goroutines and closes open files. It is
+// idempotent: repeated calls are no-ops.
 func (w *WAL) Close() error {
-	close(w.manager.stop)
-	<-w.manager.done
-	close(w.writer.stop)
-	<-w.writer.done
-	return nil
+	var err error
+	w.closeOnce.Do(func() {
+		close(w.manager.stop)
+		<-w.manager.done
+		close(w.writer.stop)
+		<-w.writer.done
+	})
+	return err
 }

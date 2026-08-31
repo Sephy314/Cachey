@@ -54,7 +54,7 @@ type Node struct {
 	peers   []string
 	cfg     Config
 	tr      Transport
-	applyFn func(Entry)  // applies one committed entry to the FSM
+	applyFn func(Entry)        // applies one committed entry to the FSM
 	onRole  func(Role, uint64) // notifies leadership transitions
 
 	mu          sync.Mutex
@@ -63,6 +63,7 @@ type Node struct {
 	currentTerm uint64
 	votedFor    string
 	log         *Log
+	logStore    LogStore
 	commitIndex uint64
 	lastApplied uint64
 	leaderID    string
@@ -299,14 +300,20 @@ func (n *Node) tryBecomeLeader(term uint64) bool {
 	if n.role != RoleCandidate || n.currentTerm != term {
 		return false
 	}
+	// Append a no-op entry in the current term so entries from previous terms
+	// get committed (Raft §5.4.2). It must be durable first so the log stays
+	// contiguous across a crash+recovery (later entries reference its index).
+	noopIdx := n.log.lastIndex() + 1
+	if err := n.persistEntryLocked(noopIdx, Entry{Term: term}); err != nil {
+		n.logf("persist no-op at %d failed: %v", noopIdx, err)
+		return false // stay a candidate; a later election retries
+	}
 	n.role = RoleLeader
 	n.leaderID = n.id
 	for _, p := range n.peers {
 		n.nextIndex[p] = n.log.lastIndex() + 1
 		n.matchIndex[p] = 0
 	}
-	// Append a no-op entry in the current term so entries from previous terms
-	// get committed (Raft §5.4.2).
 	n.log.append(Entry{Term: term})
 	// The leader's own entries are always on a majority (itself); a single-node
 	// cluster commits immediately, larger clusters wait for followers.
@@ -381,6 +388,17 @@ func (n *Node) HandleAppendEntries(args *AppendEntries) *AppendEntriesReply {
 	if args.PrevLogIndex > 0 && n.log.termAt(args.PrevLogIndex) != args.PrevLogTerm {
 		return reply // conflict; leader will back off
 	}
+	// Durably persist every entry we don't already have before ACKing, so a
+	// committed entry survives a follower crash (Raft §5.4).
+	for i, e := range args.Entries {
+		idx := args.PrevLogIndex + 1 + uint64(i)
+		if idx <= n.log.lastIndex() && n.log.termAt(idx) == e.Term {
+			continue // already present and durable
+		}
+		if err := n.persistEntryLocked(idx, e); err != nil {
+			return reply // not acknowledged; the leader will retry
+		}
+	}
 	for i, e := range args.Entries {
 		idx := args.PrevLogIndex + 1 + uint64(i)
 		if idx <= n.log.lastIndex() {
@@ -411,8 +429,15 @@ func (n *Node) Propose(command []byte) (uint64, error) {
 		n.mu.Unlock()
 		return 0, ErrNotLeader
 	}
-	n.log.append(Entry{Term: n.currentTerm, Command: command})
-	idx := n.log.lastIndex()
+	idx := n.log.lastIndex() + 1
+	e := Entry{Term: n.currentTerm, Command: command}
+	// Durable before the entry enters the replicated log (crash safety: a
+	// committed entry must survive on the leader).
+	if err := n.persistEntryLocked(idx, e); err != nil {
+		n.mu.Unlock()
+		return 0, err
+	}
+	n.log.append(e)
 	// The leader always has its own entries; a single-node cluster commits
 	// immediately, larger clusters wait for a majority of followers.
 	n.updateCommitIndexLocked()

@@ -200,6 +200,8 @@ func (s *CacheyStore) ApplyRecord(rec wal.Record) error {
 		s.deleteLocked(rec.Key)
 	case wal.OpTTL:
 		s.ttlAtLocked(rec.Key, rec.Exp)
+	case wal.OpNoop:
+		// Raft no-op entry: no state change.
 	default:
 		return fmt.Errorf("wal: unknown op %q", rec.Op)
 	}

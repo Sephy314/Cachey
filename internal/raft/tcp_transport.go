@@ -61,6 +61,11 @@ func (t *TCPTransport) SetPeers(addrs map[string]string) {
 	t.peerAddrs = addrs
 }
 
+// SetNode wires the local raft node that inbound RPCs are dispatched to.
+func (t *TCPTransport) SetNode(n *Node) {
+	t.node = n
+}
+
 // Listen binds the local listener and starts accepting Raft RPCs. It returns
 // the bound address (useful with ":0" for tests).
 func (t *TCPTransport) Listen(addr string) (string, error) {

@@ -38,5 +38,16 @@ func (l *Log) append(es ...Entry) { l.entries = append(l.entries, es...) }
 // from must be >= 1 (index 0 is never removed).
 func (l *Log) truncate(from uint64) { l.entries = l.entries[:from] }
 
+// set places e at index i, removing any existing entry at i and everything
+// after it. Used when rebuilding the log from the WAL after recovery: records
+// replay in WAL order and a later record at the same index (a newer term)
+// supersedes an older conflicting tail. i must be >= 1.
+func (l *Log) set(i uint64, e Entry) {
+	if i < uint64(len(l.entries)) {
+		l.entries = l.entries[:i]
+	}
+	l.entries = append(l.entries, e)
+}
+
 // slice returns entries from index from (inclusive) to the end.
 func (l *Log) slice(from uint64) []Entry { return l.entries[from:] }
