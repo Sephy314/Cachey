@@ -61,6 +61,14 @@ func (t *TCPTransport) SetPeers(addrs map[string]string) {
 	t.peerAddrs = addrs
 }
 
+// RegisterPeer adds or updates the address for a peer (dynamic membership).
+// It implements raft.PeerRegistrar.
+func (t *TCPTransport) RegisterPeer(id, addr string) {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	t.peerAddrs[id] = addr
+}
+
 // SetNode wires the local raft node that inbound RPCs are dispatched to.
 func (t *TCPTransport) SetNode(n *Node) {
 	t.node = n
@@ -187,13 +195,18 @@ func (t *TCPTransport) roundTrip(ctx context.Context, peer, reqKind string, req,
 		return err
 	}
 	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
+	if pc.conn == nil {
+		pc.mu.Unlock()
+		t.forget(peer)
+		return errors.New("raft: peer connection closed")
+	}
 	if err := pc.writeReq(reqKind, req); err != nil {
+		pc.mu.Unlock()
 		t.forget(peer)
 		return err
 	}
 	line, err := pc.readReply()
+	pc.mu.Unlock()
 	if err != nil {
 		t.forget(peer)
 		return err
@@ -218,8 +231,14 @@ func (t *TCPTransport) roundTrip(ctx context.Context, peer, reqKind string, req,
 func (t *TCPTransport) peerConn(peer string) (*peerConn, error) {
 	t.connMu.Lock()
 	defer t.connMu.Unlock()
-	if pc, ok := t.conns[peer]; ok && pc.isOpen() {
-		return pc, nil
+	if pc, ok := t.conns[peer]; ok {
+		pc.mu.Lock()
+		open := pc.conn != nil
+		pc.mu.Unlock()
+		if open {
+			return pc, nil
+		}
+		delete(t.conns, peer) // stale closed conn: redial
 	}
 	addr, ok := t.peerAddrs[peer]
 	if !ok {
@@ -264,15 +283,12 @@ func (t *TCPTransport) Close() error {
 }
 
 // peerConn is one persistent connection to a peer; requests on it are
-// serialized by mu so wire frames never interleave.
+// serialized by mu so wire frames never interleave, and conn is only touched
+// while mu is held.
 type peerConn struct {
 	conn net.Conn
 	rd   *bufio.Reader
 	mu   sync.Mutex
-}
-
-func (pc *peerConn) isOpen() bool {
-	return pc.conn != nil
 }
 
 func (pc *peerConn) writeReq(kind string, v any) error {
@@ -299,6 +315,8 @@ func (pc *peerConn) readReply() ([]byte, error) {
 }
 
 func (pc *peerConn) close() {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
 	if pc.conn != nil {
 		pc.conn.Close()
 		pc.conn = nil

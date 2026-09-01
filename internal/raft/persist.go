@@ -15,7 +15,7 @@ const persistTimeout = 5 * time.Second
 // The WAL-backed implementation writes each entry as a wal.Record carrying the
 // raft term and index.
 type LogStore interface {
-	AppendEntry(ctx context.Context, idx, term uint64, cmd []byte) error
+	AppendEntry(ctx context.Context, idx, term uint64, entry Entry) error
 }
 
 // SetLogStore enables durable persistence of the replicated log. Call after
@@ -39,23 +39,32 @@ func (n *Node) persistEntryLocked(idx uint64, e Entry) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
 	defer cancel()
-	return n.logStore.AppendEntry(ctx, idx, e.Term, e.Command)
+	return n.logStore.AppendEntry(ctx, idx, e.Term, e)
 }
 
-// walLogStore persists raft log entries through Cachey's existing WAL, mapping
-// each entry to a wal.Record that reuses the PUT/DEL/TTL ops as the command.
+// walLogStore persists raft log entries through Cachey's existing WAL: data
+// entries reuse the PUT/DEL/TTL ops as the command, no-ops use OpNoop, and
+// membership changes use OpConfig with the serialized configuration.
 type walLogStore struct{ w *wal.WAL }
 
 // NewWALLogStore returns a LogStore backed by w.
 func NewWALLogStore(w *wal.WAL) LogStore { return walLogStore{w: w} }
 
-func (s walLogStore) AppendEntry(ctx context.Context, idx, term uint64, cmd []byte) error {
+func (s walLogStore) AppendEntry(ctx context.Context, idx, term uint64, entry Entry) error {
 	var rec wal.Record
-	if cmd != nil {
-		if err := json.Unmarshal(cmd, &rec); err != nil {
+	switch {
+	case entry.Config != nil:
+		cfg, err := json.Marshal(entry.Config)
+		if err != nil {
 			return err
 		}
-	} else {
+		rec.Op = wal.OpConfig
+		rec.Config = cfg
+	case entry.Command != nil:
+		if err := json.Unmarshal(entry.Command, &rec); err != nil {
+			return err
+		}
+	default:
 		rec.Op = wal.OpNoop
 	}
 	rec.Term = term
@@ -68,16 +77,40 @@ func (s walLogStore) AppendEntry(ctx context.Context, idx, term uint64, cmd []by
 // at its raft index, and a later record at the same index (a newer term)
 // supersedes an older conflicting tail (see Log.set).
 func (n *Node) ApplyRecoveredRecord(rec wal.Record) error {
-	var cmd []byte
-	if rec.Op != wal.OpNoop {
-		b, err := json.Marshal(rec)
+	var entry Entry
+	switch rec.Op {
+	case wal.OpConfig:
+		var cfg Configuration
+		if err := json.Unmarshal(rec.Config, &cfg); err != nil {
+			return err
+		}
+		entry.Config = &cfg
+	case wal.OpNoop:
+		// entry stays empty
+	default:
+		cmd, err := json.Marshal(rec)
 		if err != nil {
 			return err
 		}
-		cmd = b
+		entry.Command = cmd
 	}
+	entry.Term = rec.Term
 	n.mu.Lock()
-	n.log.set(rec.RaftIndex, Entry{Term: rec.Term, Command: cmd})
+	n.log.set(rec.RaftIndex, entry)
+	// Adopt the voter set from the last config entry in the recovered log
+	// (n.peers stores only the other voters).
+	// ponytail: this assumes the last config entry was committed; an uncommitted
+	// tail is corrected by the live leader's LeaderCommit. Persisting the
+	// committed config separately (with term/votedFor) is the upgrade path.
+	if entry.Config != nil {
+		var peers []string
+		for _, id := range entry.Config.Voters {
+			if id != n.id {
+				peers = append(peers, id)
+			}
+		}
+		n.peers = peers
+	}
 	n.mu.Unlock()
 	return nil
 }

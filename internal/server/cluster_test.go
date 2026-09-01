@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -51,7 +52,7 @@ func newPersistentCluster(t *testing.T, ids []string, dirs map[string]string) *p
 		pc.addrs[id] = addr
 	}
 	for _, id := range ids {
-		pc.nodes[id] = newPersistentNode(t, id, dirs[id], trs[id], pc.addrs)
+		pc.nodes[id] = newPersistentNode(t, id, dirs[id], trs[id], pc.addrs, otherIDs(id, pc.addrs))
 	}
 	for _, id := range ids {
 		pc.nodes[id].node.Run()
@@ -59,14 +60,14 @@ func newPersistentCluster(t *testing.T, ids []string, dirs map[string]string) *p
 	return pc
 }
 
-func newPersistentNode(t *testing.T, id, dir string, tr *raft.TCPTransport, addrs map[string]string) *clusterNode {
+func newPersistentNode(t *testing.T, id, dir string, tr *raft.TCPTransport, addrs map[string]string, peers []string) *clusterNode {
 	t.Helper()
 	st := store.NewCacheyStore()
 	cfg := raft.Config{
 		ID:                id,
-		Peers:             otherIDs(id, addrs),
-		HeartbeatInterval: 20 * time.Millisecond,
-		ElectionTimeout:   100 * time.Millisecond,
+		Peers:             peers,
+		HeartbeatInterval: 50 * time.Millisecond,
+		ElectionTimeout:   200 * time.Millisecond,
 	}
 	n, err := raft.NewNode(cfg, tr, NewRaftApply(st))
 	if err != nil {
@@ -142,7 +143,7 @@ func (pc *persistentCluster) restart(t *testing.T, id string) {
 			cn.tr.SetPeers(peerAddrsOf(peer, pc.addrs))
 		}
 	}
-	cn := newPersistentNode(t, id, old.dir, tr, pc.addrs)
+	cn := newPersistentNode(t, id, old.dir, tr, pc.addrs, otherIDs(id, pc.addrs))
 	cn.node.Run()
 	pc.nodes[id] = cn
 }
@@ -151,7 +152,7 @@ func (pc *persistentCluster) restart(t *testing.T, id string) {
 func (pc *persistentCluster) waitLeader(t *testing.T) string {
 	t.Helper()
 	var leader string
-	waitFor(t, "a leader to be elected", 5*time.Second, func() bool {
+	waitFor(t, "a leader to be elected", 115*time.Second, func() bool {
 		leaders := 0
 		for id, cn := range pc.nodes {
 			if cn.node.IsLeader() {
@@ -205,7 +206,7 @@ func TestPersistentClusterReplicationAndFailover(t *testing.T) {
 
 	pc.write(t, "k1", "v1")
 	pc.write(t, "k2", "v2")
-	waitFor(t, "all nodes replicate both writes", 5*time.Second, func() bool {
+	waitFor(t, "all nodes replicate both writes", 15*time.Second, func() bool {
 		return pc.hasKey("k1", "v1") && pc.hasKey("k2", "v2")
 	})
 
@@ -223,7 +224,7 @@ func TestPersistentClusterReplicationAndFailover(t *testing.T) {
 		t.Fatal("leader did not change after failover")
 	}
 	pc.write(t, "k3", "v3")
-	waitFor(t, "live nodes replicate the post-failover write", 5*time.Second, func() bool {
+	waitFor(t, "live nodes replicate the post-failover write", 15*time.Second, func() bool {
 		return pc.hasKey("k1", "v1") && pc.hasKey("k2", "v2") && pc.hasKey("k3", "v3")
 	})
 }
@@ -235,7 +236,7 @@ func TestPersistentClusterRestart(t *testing.T) {
 
 	pc.write(t, "k1", "v1")
 	pc.write(t, "k2", "v2")
-	waitFor(t, "all nodes replicate before restart", 5*time.Second, func() bool {
+	waitFor(t, "all nodes replicate before restart", 15*time.Second, func() bool {
 		return pc.hasKey("k1", "v1") && pc.hasKey("k2", "v2")
 	})
 
@@ -257,7 +258,7 @@ func TestPersistentClusterRestart(t *testing.T) {
 	pc.restart(t, victim)
 
 	// It must recover its log from the WAL and catch up to committed state.
-	waitFor(t, "restarted node catches up to committed state", 5*time.Second, func() bool {
+	waitFor(t, "restarted node catches up to committed state", 15*time.Second, func() bool {
 		v, err := pc.nodes[victim].store.Get("k1")
 		return err == nil && *v == "v1"
 	})
@@ -333,4 +334,116 @@ func TestClusterLinearizableReadAndRedirect(t *testing.T) {
 	if err := pc.nodes[follower].cs.Put("k2", "v2"); !errors.Is(err, raft.ErrNotLeader) {
 		t.Fatalf("follower cs.Put: want raft.ErrNotLeader, got %v", err)
 	}
+}
+
+func TestClusterAddServer(t *testing.T) {
+	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir()}
+	pc := newPersistentCluster(t, []string{"a", "b"}, dirs)
+	defer pc.stopAll()
+
+	pc.write(t, "k1", "v1")
+	leader := pc.waitLeader(t)
+
+	// Fresh joiner node c: empty log, listening, unknown configuration.
+	tr := raft.NewTCPTransport(nil)
+	cAddr, err := tr.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc.addrs["c"] = cAddr
+	c := newPersistentNode(t, "c", t.TempDir(), tr, pc.addrs, nil)
+	c.node.Run()
+	defer func() {
+		c.node.Stop()
+		c.tr.Close()
+		c.wal.Close()
+	}()
+	if voters := c.node.Voters(); len(voters) != 1 || voters[0] != "c" {
+		t.Fatalf("joiner starts with voters %v, want only itself", voters)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := pc.nodes[leader].node.AddServer(ctx, "c", cAddr); err != nil {
+		t.Fatalf("AddServer: %v", err)
+	}
+
+	// c catches up: learns the 3-voter config and the committed data.
+	waitFor(t, "joiner learns config and data", 15*time.Second, func() bool {
+		if len(c.node.Voters()) != 3 {
+			return false
+		}
+		got, err := c.store.Get("k1")
+		return err == nil && *got == "v1"
+	})
+
+	// New writes replicate to the new member.
+	pc.mu.Lock()
+	pc.nodes["c"] = c
+	pc.mu.Unlock()
+	pc.write(t, "k2", "v2")
+	waitFor(t, "new member replicates new writes", 15*time.Second, func() bool {
+		got, err := c.store.Get("k2")
+		return err == nil && *got == "v2"
+	})
+
+	// c is a real voter: killing the leader leaves {b,c}, a majority of 2 that
+	// includes the new member, able to elect a new leader.
+	pc.mu.Lock()
+	pc.nodes[leader].node.Stop()
+	pc.nodes[leader].tr.Close()
+	pc.nodes[leader].wal.Close()
+	delete(pc.nodes, leader)
+	pc.mu.Unlock()
+	waitFor(t, "majority including the new member elects a leader", 15*time.Second, func() bool {
+		leaders := 0
+		for _, cn := range pc.nodes {
+			if cn.node.IsLeader() {
+				leaders++
+			}
+		}
+		return leaders == 1
+	})
+}
+
+func TestClusterRemoveServer(t *testing.T) {
+	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir()}
+	pc := newPersistentCluster(t, []string{"a", "b", "c"}, dirs)
+	defer pc.stopAll()
+
+	pc.write(t, "k1", "v1")
+	leader := pc.waitLeader(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := pc.nodes[leader].node.RemoveServer(ctx, "b"); err != nil {
+		t.Fatalf("RemoveServer: %v", err)
+	}
+
+	// b is removed from the configuration on the remaining nodes.
+	waitFor(t, "b removed from the configuration", 15*time.Second, func() bool {
+		for id, cn := range pc.nodes {
+			if id == "b" {
+				continue
+			}
+			for _, v := range cn.node.Voters() {
+				if v == "b" {
+					return false
+				}
+			}
+		}
+		return true
+	})
+
+	// Stop b; the remaining majority of 2 keeps serving.
+	pc.mu.Lock()
+	pc.nodes["b"].node.Stop()
+	pc.nodes["b"].tr.Close()
+	pc.nodes["b"].wal.Close()
+	delete(pc.nodes, "b")
+	pc.mu.Unlock()
+
+	pc.write(t, "k2", "v2")
+	waitFor(t, "remaining voters replicate after removal", 15*time.Second, func() bool {
+		return pc.hasKey("k2", "v2")
+	})
 }

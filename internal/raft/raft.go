@@ -8,6 +8,7 @@ package raft
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"math/rand"
 	"sync"
@@ -73,11 +74,21 @@ type Node struct {
 	nextIndex  map[string]uint64
 	matchIndex map[string]uint64
 
+	// joining holds non-voting members being caught up before a membership
+	// change commits (replicated to but not counted in majorities).
+	joining map[string]bool
+
 	electionReset chan struct{}
 	stopOnce      sync.Once
 	stopCh        chan struct{}
 	doneCh        chan struct{}
 	rng           *rand.Rand
+}
+
+// PeerRegistrar is implemented by transports that can learn new peer addresses
+// at runtime (used when adding servers to the cluster).
+type PeerRegistrar interface {
+	RegisterPeer(id, addr string)
 }
 
 // NewNode creates a Raft node. applyFn is called once per committed entry, in
@@ -105,6 +116,7 @@ func NewNode(cfg Config, tr Transport, applyFn func(Entry)) (*Node, error) {
 		log:           NewLog(),
 		nextIndex:     make(map[string]uint64),
 		matchIndex:    make(map[string]uint64),
+		joining:       make(map[string]bool),
 		electionReset: make(chan struct{}, 1),
 		stopCh:        make(chan struct{}),
 		doneCh:        make(chan struct{}),
@@ -112,6 +124,41 @@ func NewNode(cfg Config, tr Transport, applyFn func(Entry)) (*Node, error) {
 	}
 	n.commitCond = sync.NewCond(&n.mu)
 	return n, nil
+}
+
+// isVoter reports whether id is in the current committed voter set. Caller
+// must hold n.mu.
+func (n *Node) isVoter(id string) bool {
+	for _, p := range n.peers {
+		if p == id {
+			return true
+		}
+	}
+	return false
+}
+
+// majorityLocked returns the number of votes needed for a quorum in the
+// current voter set, which includes this node (peers excludes self): cluster
+// size N = len(peers)+1, quorum = N/2 + 1. Caller must hold n.mu.
+func (n *Node) majorityLocked() int {
+	return (len(n.peers)+1)/2 + 1
+}
+
+// replicateSetLocked returns the IDs this node replicates to: all voters plus
+// any non-voting joining members. Caller must hold n.mu.
+func (n *Node) replicateSetLocked() []string {
+	set := make(map[string]bool, len(n.peers)+len(n.joining))
+	for _, p := range n.peers {
+		set[p] = true
+	}
+	for p := range n.joining {
+		set[p] = true
+	}
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	return out
 }
 
 // Run starts the node's background goroutines (election timer, heartbeats).
@@ -236,20 +283,21 @@ func (n *Node) startElection() {
 	term := n.currentTerm
 	lastLogIndex := n.log.lastIndex()
 	lastLogTerm := n.log.lastTerm()
+	majority := n.majorityLocked()
+	peers := append([]string(nil), n.peers...)
 	n.mu.Unlock()
 
 	// A single-node cluster is always its own majority.
-	if len(n.peers) == 0 {
+	if len(peers) == 0 {
 		n.tryBecomeLeader(term)
 		n.broadcastAppendEntries()
 		return
 	}
 
 	votes := 1 // self
-	majority := len(n.peers)/2 + 1
 	var mu sync.Mutex
 
-	for _, peer := range n.peers {
+	for _, peer := range peers {
 		go func(peer string) {
 			args := &RequestVote{
 				Term:         term,
@@ -425,6 +473,22 @@ func (n *Node) HandleAppendEntries(args *AppendEntries) *AppendEntriesReply {
 
 // ---- replication (Raft §5.3, leader side) ----
 
+// appendEntryLocked durably appends e to the log and advances the commit
+// index if it is on a majority. Must be called with n.mu held by the leader.
+func (n *Node) appendEntryLocked(e Entry) (uint64, error) {
+	idx := n.log.lastIndex() + 1
+	// Durable before the entry enters the replicated log (crash safety: a
+	// committed entry must survive on the leader).
+	if err := n.persistEntryLocked(idx, e); err != nil {
+		return 0, err
+	}
+	n.log.append(e)
+	// The leader always has its own entries; a single-node cluster commits
+	// immediately, larger clusters wait for a majority of followers.
+	n.updateCommitIndexLocked()
+	return idx, nil
+}
+
 // Propose submits a client command for replication. Returns the log index of
 // the entry. Only valid on the leader; followers get ErrNotLeader.
 func (n *Node) Propose(command []byte) (uint64, error) {
@@ -433,19 +497,11 @@ func (n *Node) Propose(command []byte) (uint64, error) {
 		n.mu.Unlock()
 		return 0, ErrNotLeader
 	}
-	idx := n.log.lastIndex() + 1
-	e := Entry{Term: n.currentTerm, Command: command}
-	// Durable before the entry enters the replicated log (crash safety: a
-	// committed entry must survive on the leader).
-	if err := n.persistEntryLocked(idx, e); err != nil {
-		n.mu.Unlock()
+	idx, err := n.appendEntryLocked(Entry{Term: n.currentTerm, Command: command})
+	n.mu.Unlock()
+	if err != nil {
 		return 0, err
 	}
-	n.log.append(e)
-	// The leader always has its own entries; a single-node cluster commits
-	// immediately, larger clusters wait for a majority of followers.
-	n.updateCommitIndexLocked()
-	n.mu.Unlock()
 	n.broadcastAppendEntries()
 	return idx, nil
 }
@@ -465,7 +521,10 @@ func (n *Node) WaitApplied(ctx context.Context, idx uint64) error {
 }
 
 func (n *Node) broadcastAppendEntries() {
-	for _, peer := range n.peers {
+	n.mu.Lock()
+	peers := n.replicateSetLocked()
+	n.mu.Unlock()
+	for _, peer := range peers {
 		go n.replicateTo(peer)
 	}
 }
@@ -531,7 +590,7 @@ func (n *Node) updateCommitIndexLocked() {
 				count++
 			}
 		}
-		if count > len(n.peers)/2 {
+		if count >= n.majorityLocked() {
 			n.commitIndex = N
 		} else {
 			break
@@ -541,16 +600,131 @@ func (n *Node) updateCommitIndexLocked() {
 }
 
 // applyCommittedLocked applies entries (lastApplied, commitIndex] to the FSM
-// in order. No-op entries (nil Command) are skipped.
+// in order. No-op entries (nil Command/Config) are skipped; configuration
+// changes update the voter set instead of the store.
 func (n *Node) applyCommittedLocked() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
 		e := n.log.entryAt(n.lastApplied)
-		if e.Command != nil && n.applyFn != nil {
+		switch {
+		case e.Config != nil:
+			n.applyConfigLocked(e.Config)
+		case e.Command != nil && n.applyFn != nil:
 			n.applyFn(e)
 		}
 	}
 	n.commitCond.Broadcast()
+}
+
+// applyConfigLocked adopts a committed configuration: it replaces the voter
+// set and reconciles leader bookkeeping (dropping removed servers, keeping
+// joining members that were promoted to voters).
+func (n *Node) applyConfigLocked(cfg *Configuration) {
+	oldPeers := n.peers
+	// n.peers stores only the OTHER voters; adopt the full config minus self.
+	var newPeers []string
+	for _, id := range cfg.Voters {
+		if id != n.id {
+			newPeers = append(newPeers, id)
+		}
+	}
+	n.peers = newPeers
+	if n.role == RoleLeader {
+		for _, id := range cfg.Voters {
+			if _, ok := n.nextIndex[id]; !ok {
+				n.nextIndex[id] = n.log.lastIndex() + 1
+				n.matchIndex[id] = 0
+			}
+		}
+		// Drop leader state for voters that left.
+		for _, id := range oldPeers {
+			if !n.isVoter(id) {
+				delete(n.nextIndex, id)
+				delete(n.matchIndex, id)
+			}
+		}
+	}
+	for id := range n.joining {
+		delete(n.joining, id)
+		if !n.isVoter(id) {
+			delete(n.nextIndex, id)
+			delete(n.matchIndex, id)
+		}
+	}
+	// A leader that removes itself from the cluster steps down once the
+	// change commits.
+	if n.role == RoleLeader && !n.isVoter(n.id) {
+		n.stepDownLocked(n.currentTerm)
+	}
+}
+
+// Voters returns the current full voter set, including this node.
+func (n *Node) Voters() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]string{n.id}, n.peers...)
+}
+
+// AddServer adds id (reachable at addr) to the cluster as a voting member
+// (single-server membership change, Raft §6). It must be called on the leader
+// and returns once the membership change is committed and applied. The new
+// server is caught up as a non-voting member while the change is in flight.
+func (n *Node) AddServer(ctx context.Context, id, addr string) error {
+	n.mu.Lock()
+	if n.role != RoleLeader {
+		n.mu.Unlock()
+		return ErrNotLeader
+	}
+	if n.isVoter(id) || n.joining[id] {
+		n.mu.Unlock()
+		return fmt.Errorf("raft: %s is already a member", id)
+	}
+	if pr, ok := n.tr.(PeerRegistrar); ok && addr != "" {
+		pr.RegisterPeer(id, addr)
+	}
+	n.joining[id] = true
+	n.nextIndex[id] = 1
+	n.matchIndex[id] = 0
+	// Configuration carries the full voter set, including this node.
+	voters := append([]string{n.id}, n.peers...)
+	voters = append(voters, id)
+	idx, err := n.appendEntryLocked(Entry{Term: n.currentTerm, Config: &Configuration{Voters: voters}})
+	n.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	n.broadcastAppendEntries()
+	return n.WaitApplied(ctx, idx)
+}
+
+// RemoveServer removes id from the cluster (single-server membership change,
+// Raft §6). Must be called on the leader; returns once the change is
+// committed and applied. After it returns, id is no longer a voting member
+// and stops receiving replication.
+func (n *Node) RemoveServer(ctx context.Context, id string) error {
+	n.mu.Lock()
+	if n.role != RoleLeader {
+		n.mu.Unlock()
+		return ErrNotLeader
+	}
+	if id != n.id && !n.isVoter(id) {
+		n.mu.Unlock()
+		return fmt.Errorf("raft: %s is not a member", id)
+	}
+	voters := make([]string, 0, len(n.peers)+1)
+	voters = append(voters, n.id)
+	for _, p := range n.peers {
+		if p != id {
+			voters = append(voters, p)
+		}
+	}
+	idx, err := n.appendEntryLocked(Entry{Term: n.currentTerm, Config: &Configuration{Voters: voters}})
+	n.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	n.broadcastAppendEntries()
+	return n.WaitApplied(ctx, idx)
 }
 
 // logf logs a message with the node's identity and term.

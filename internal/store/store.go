@@ -206,6 +206,9 @@ func (s *CacheyStore) ApplyRecord(rec wal.Record) error {
 		s.ttlAtLocked(rec.Key, rec.Exp)
 	case wal.OpNoop:
 		// Raft no-op entry: no state change.
+	case wal.OpConfig:
+		// Raft configuration-change entry: handled by the raft node, not the
+		// store. Kept as a no-op so mixed-mode recovery is safe.
 	default:
 		return fmt.Errorf("wal: unknown op %q", rec.Op)
 	}

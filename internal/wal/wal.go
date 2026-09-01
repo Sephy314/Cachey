@@ -38,6 +38,9 @@ const (
 	// OpNoop marks a Raft no-op entry (committed to advance the commit index);
 	// it carries no state change.
 	OpNoop Op = "NOOP"
+	// OpConfig marks a Raft configuration-change entry; Config holds the
+	// serialized membership.
+	OpConfig Op = "CONFIG"
 )
 
 // Record is a single logical WAL entry. LogIndex is assigned by the writer in
@@ -46,7 +49,8 @@ const (
 // Term and RaftIndex are set when the WAL is used as the persistence backend
 // for the Raft replicated log: Term is the entry's Raft term and RaftIndex is
 // its index in the Raft log (which may repeat after a Raft truncation). They
-// are ignored by the store's FSM apply.
+// are ignored by the store's FSM apply. Config is only set for OpConfig
+// records (Raft membership changes).
 type Record struct {
 	Op        Op     `json:"op"`
 	Key       string `json:"key"`
@@ -55,6 +59,7 @@ type Record struct {
 	LogIndex  uint64 `json:"log_index"`
 	Term      uint64 `json:"term,omitempty"`       // raft term (raft log entries)
 	RaftIndex uint64 `json:"raft_index,omitempty"` // raft log index (raft log entries)
+	Config    []byte `json:"config,omitempty"`     // serialized raft membership (CONFIG op)
 }
 
 // marshal serializes a record as one NDJSON line (including trailing newline).

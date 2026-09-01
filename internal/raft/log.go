@@ -1,12 +1,22 @@
 package raft
 
+// Configuration is a cluster membership: the set of voting server IDs.
+// Membership changes are themselves log entries carrying the full new
+// configuration, applied (and effective for majorities) only once committed.
+type Configuration struct {
+	Voters []string `json:"voters"`
+}
+
 // Entry is one replicated log entry. Term is the term in which the leader
 // received it; Command is the client mutation (a wal.Record payload) applied
-// to the state machine when the entry commits. A nil Command is a no-op entry
-// used to commit previous-term entries when a new leader is elected.
+// to the state machine when the entry commits. Config marks a membership
+// change (its payload, not a store command); a nil Command and nil Config is
+// a no-op entry used to commit previous-term entries when a new leader is
+// elected.
 type Entry struct {
-	Term    uint64 `json:"term"`
-	Command []byte `json:"command,omitempty"`
+	Term    uint64         `json:"term"`
+	Command []byte         `json:"command,omitempty"`
+	Config  *Configuration `json:"config,omitempty"`
 }
 
 // Log is the replicated log. entries[0] is a dummy entry at index 0 (never

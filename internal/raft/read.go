@@ -50,7 +50,7 @@ func (n *Node) confirmLeadership(ctx context.Context) error {
 	if len(n.peers) == 0 {
 		return nil // a single-node cluster is always a majority
 	}
-	majority := len(n.peers)/2 + 1
+	majority := n.majorityLocked()
 	acks := 1 // self
 
 	n.mu.Lock()
