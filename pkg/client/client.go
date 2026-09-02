@@ -3,6 +3,7 @@ package client
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"net"
 	"strings"
 
@@ -48,4 +49,19 @@ func (c *Client) SendCommand(cmd protocol.Command) (*string, error) {
 
 func (c *Client) Close() error {
 	return c.conn.Close()
+}
+
+// RedirectLeader extracts the leader's address from a redirect error returned
+// by SendCommand, if the server indicated one (a CodeUnavailable status whose
+// message is "not leader: <addr>"). Returns ok=false otherwise.
+func RedirectLeader(err error) (string, bool) {
+	var st *protocol.Status
+	if !errors.As(err, &st) || st.Code != protocol.CodeUnavailable {
+		return "", false
+	}
+	addr, found := strings.CutPrefix(st.Message, "not leader: ")
+	if !found || addr == "" {
+		return "", false
+	}
+	return addr, true
 }

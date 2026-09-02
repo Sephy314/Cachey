@@ -19,7 +19,12 @@ jobs:
           cache: true
 
       - name: Run tests
-        run: go test ./...
+        # -p 1 runs packages sequentially: the raft integration tests drive
+        # real-time leader elections over TCP, and running every package's
+        # tests in parallel starves those goroutines of CPU, which makes the
+        # timing-sensitive consensus tests flaky. Serializing packages keeps
+        # them reliable.
+        run: go test -p 1 ./...
 
       - name: Run vet
         run: go vet ./...

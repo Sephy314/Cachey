@@ -19,6 +19,10 @@ type Store interface {
 	Delete(key string) error
 	TTL(key string, ttlMillis int64) error
 	Alive() string
+	// Leader returns the current cluster leader's client address, or "" if
+	// this node is the leader, no leader is known, or the store is a
+	// single node. Used to redirect clients.
+	Leader() string
 }
 
 // Entry is a stored value with an optional expiration. Exp is a Unix
@@ -200,6 +204,11 @@ func (s *CacheyStore) ApplyRecord(rec wal.Record) error {
 		s.deleteLocked(rec.Key)
 	case wal.OpTTL:
 		s.ttlAtLocked(rec.Key, rec.Exp)
+	case wal.OpNoop:
+		// Raft no-op entry: no state change.
+	case wal.OpConfig:
+		// Raft configuration-change entry: handled by the raft node, not the
+		// store. Kept as a no-op so mixed-mode recovery is safe.
 	default:
 		return fmt.Errorf("wal: unknown op %q", rec.Op)
 	}
@@ -225,3 +234,6 @@ func (s *CacheyStore) Snapshot() ([]wal.SnapshotEntry, error) {
 func (s *CacheyStore) Alive() string {
 	return "ALIVE"
 }
+
+// Leader reports no cluster leader for the single-node store.
+func (s *CacheyStore) Leader() string { return "" }
