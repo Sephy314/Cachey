@@ -14,44 +14,57 @@
 
 ## 🌱 Overview
 
-Cachey is a **distributed key-value cache store**. The long-term goal
-is a cluster of nodes that replicate and shard data across machines —
-not just a fast local cache on a single box.
+Cachey is a **distributed key-value cache store** built in Go. It grows a
+replicated, consistent cluster out of a plain in-memory store: writes go
+through a **Raft leader**, are durably logged, and are applied to every
+replica the moment they commit.
 
-The current implementation is the **first single-node foundation**: an
-in-memory store exposed over TCP with newline-delimited JSON (NDJSON)
-request and response framing. This is the base layer everything
-distributed will be built on top of — step by step, this single node
-grows into a **replicated, sharded** cluster.
+The **Raft consensus engine** is implemented and tested end to end — leader
+election, log replication with WAL-backed durability, commit/apply, dynamic
+membership, linearizable reads, leader redirect, and snapshot/log
+compaction. The runnable `cacheyd` binary still starts a single node today;
+wiring it into a multi-node cluster is the next step before keys are sharded
+across machines.
 
 <br>
 
-## 🎯 Vision
+## 🎯 Status
 
-At its core, Cachey is about **distribution** — spreading data and load
-across many machines instead of relying on one. It's designed to evolve
-from a local in-memory store into a full distributed cache with these
-core properties:
-
-| | Property | Description |
+| | Area | Status |
 |---|---|---|
-| 🧠 | **Raft-based consensus** | A consistent, replicated state machine |
-| 🔀 | **Sharding** | Partition keys and scale horizontally across nodes |
-| 🛡️ | **Failure detection & recovery** | Resilience to node and network failures |
-| 🔌 | **Stable client protocol** | Hides cluster details from clients |
+| 🧠 | **Raft-based consensus** | ✅ Implemented — leader election, replication, membership, linearizable reads, snapshots |
+| 🔀 | **Sharding** | 🚧 Roadmap — next after `cacheyd` cluster wiring |
+| 🛡️ | **Failure detection & recovery** | ✅ Elections/failover tested; WAL + snapshot recovery |
+| 🔌 | **Stable client protocol** | ✅ NDJSON protocol + leader-redirect hints |
 
-> **Note:** these are architectural *goals* — not claims about the current implementation.
+> **Note:** the status table reflects what is implemented in this
+> repository today — the consensus *engine* and its integration tests are
+> complete, while exposing cluster mode through the `cacheyd` binary and
+> sharding keys across nodes remain on the roadmap.
 
 <br>
 
 ## ✅ Features
 
-- TCP client and server
-- Newline-delimited JSON protocol
-- In-memory key-value storage
-- `GET`, `PUT`, and `DEL` commands
-- Multiple commands over a single client connection
-- Unit and TCP integration tests
+**Core store**
+- TCP client and server over newline-delimited JSON (NDJSON)
+- `GET`, `PUT`, `DEL`, and `TTL` commands (expire a key after N ms)
+- Durable **WAL** (write-ahead log) with crash recovery, rotation, and snapshots
+- Background key-expiration sweep
+
+**Raft consensus engine** (`internal/raft`)
+- Leader election with randomized timeouts (no split votes)
+- Log replication over TCP with commit/apply to the state machine
+- Durable raft log through the existing WAL (rotation disabled in raft mode)
+- Linearizable reads via the read-index protocol
+- Leader redirect — clients are told where the current leader is
+- Dynamic membership — add/remove voting members (single-server changes)
+- Log compaction + `InstallSnapshot` catch-up for joining and restarting nodes
+- End-to-end cluster tests: replication, failover, restart recovery, add/remove
+  membership, stale-node election loss, network partitions, snapshot restore
+
+**Quality**
+- Unit, integration, and end-to-end tests plus `-race` runs
 - GitHub Actions checks for tests and static analysis
 
 <br>
@@ -78,7 +91,7 @@ cacheyd :8080
 **2. Connect with a client**
 
 Point any TCP/NDJSON client at `127.0.0.1:8080` and start sending
-`GET` / `PUT` / `DEL` commands (see [Protocol](#-protocol) below).
+`GET` / `PUT` / `TTL` / `DEL` commands (see [Protocol](#-protocol) below).
 
 <br>
 
@@ -89,9 +102,10 @@ is one JSON object followed by a newline.
 
 | Field | Type | Description |
 |---|---|---|
-| `Type` | `string` | Command name: `GET`, `PUT`, or `DEL` |
-| `Key` | `string` | Key to read, write, or delete |
+| `Type` | `string` | Command name: `GET`, `PUT`, `DEL`, `TTL`, or `ALV` |
+| `Key` | `string` | Key to read, write, expire, or delete |
 | `Val` | `string` | Value for `PUT`; returned value for `GET` |
+| `TTL` | `int64` | Millisecond lifetime for `TTL` (optional) |
 
 <table>
 <tr><th>Requests</th><th>Responses</th></tr>
@@ -101,6 +115,7 @@ is one JSON object followed by a newline.
 ```json
 {"Type":"PUT","Key":"foo","Val":"bar"}
 {"Type":"GET","Key":"foo","Val":""}
+{"Type":"TTL","Key":"foo","TTL":60000}
 {"Type":"DEL","Key":"foo","Val":""}
 ```
 
@@ -110,6 +125,7 @@ is one JSON object followed by a newline.
 ```json
 {"Type":"PUT","Key":"foo","Val":"bar"}
 {"Type":"GET","Key":"foo","Val":"bar"}
+{"Type":"TTL","Key":"foo","TTL":0}
 {"Type":"DEL","Key":"foo","Val":""}
 ```
 
@@ -130,6 +146,11 @@ gRPC-style status object instead:
 | `5` | `NotFound` | Missing key |
 | `12` | `Unimplemented` | Unknown command |
 
+When a node is part of a Raft cluster, a write or read sent to a
+non-leader fails with a `14` (`Unavailable`) status that carries the
+current leader's address — the Go client can extract it with
+`client.RedirectLeader(err)` and reconnect automatically.
+
 The Go client in `pkg/client` handles JSON serialization, newline
 framing, and status errors automatically.
 
@@ -137,11 +158,11 @@ framing, and status errors automatically.
 
 ## 🏗️ Architecture
 
-Cachey's architecture is built around one question: **how does a
-single node become a distributed cluster?** The diagrams below show
-where things stand today, and where the distributed design is headed.
+Cachey is built around one question: **how does a single node become a
+distributed cluster?** The layers below show what runs today and where
+the distributed design is headed.
 
-### Foundation (single node, today)
+### Single node (`cacheyd`, today)
 
 ```text
 Client
@@ -149,17 +170,39 @@ Client
   │  TCP / NDJSON
   ▼
 Server ──▶ Handler ──▶ Store ──▶ In-memory map
+                            │
+                            ▼
+                           WAL  (crash-safe, snapshots + rotation)
+```
+
+### Raft-replicated store (library, tested)
+
+The same handler serves reads and writes through a **replicated store**
+(`server.ClusterStore`): every mutation is proposed to the raft leader,
+replicated to a quorum of followers, durably logged, and only then
+applied to each node's FSM.
+
+```text
+Client ──▶ Handler ──▶ ClusterStore
+                         │
+                     Raft Node ──leader election + log replication──▶ peers
+                         │
+                  WAL (durable log) ──▶ FSM (CacheyStore)
+                         │
+                  snapshots / compaction
 ```
 
 | Package | Responsibility |
 |---|---|
 | `internal/protocol` | Defines commands and JSON parsing |
-| `internal/server` | Accepts TCP connections and dispatches requests |
-| `internal/store` | Defines the storage interface and in-memory store |
-| `pkg/client` | Provides a small TCP client |
-| `cmd/cacheyd` | Starts the server |
+| `internal/raft` | Consensus core: election, replication, membership, read index, snapshots |
+| `internal/server` | TCP dispatch; `ClusterStore` adapts a raft node to `store.Store` |
+| `internal/store` | Storage interface, in-memory store, and raft FSM |
+| `internal/wal` | Durable log backend for both the store and the raft log |
+| `pkg/client` | TCP client with `RedirectLeader` for cluster redirects |
+| `cmd/cacheyd` | Runs a single node (`cacheyd <addr> [data-dir]`) |
 
-### Target Distributed Architecture (the goal)
+### Target: sharded cluster (roadmap)
 
 ```text
                               Client
@@ -175,17 +218,17 @@ Server ──▶ Handler ──▶ Store ──▶ In-memory map
         Replicated state                 Replicated state
 ```
 
-The target design separates two responsibilities:
+The roadmap splits two responsibilities:
 
-- **Sharding** — decides which shard owns a key and distributes load across the cluster
-- **Raft** — keeps replicas within each shard consistent, handling leader election and log replication
+- **Sharding** — decides which shard owns a key and spreads load across nodes
+- **Raft** — keeps each shard's replicas consistent (already implemented and tested here)
 
-These boundaries will be introduced incrementally, rather than assuming
-a single-node in-memory map already provides distributed guarantees.
+Next up is wiring `cacheyd` to start and join a Raft group; then keys are
+sharded across groups.
 
 <br>
 
-## � Durability & WAL Persistence
+## 💾 Durability & WAL Persistence
 
 > **Status:** implemented (v1). Active WAL + temporary WAL + snapshot,
 > with a single writer goroutine and a background sealing/rotation
@@ -314,7 +357,7 @@ WAL has its own explicit limit, applying backpressure when full.
 
 <br>
 
-## �🛠️ Development
+## 🛠️ Development
 
 *For contributors working from a cloned copy of the repo:*
 
