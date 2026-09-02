@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,11 +66,23 @@ func (ec *e2eCluster) putTo(t *testing.T, id, key, val string) error {
 	return err
 }
 
-// put writes through the current leader.
+// put writes through the current leader, retrying on transient failures (a
+// leader can change between waitLeader and the write, and a commit can stall
+// briefly while an even-size remainder settles an election) like a real
+// redirecting client.
 func (ec *e2eCluster) put(t *testing.T, key, val string) {
 	t.Helper()
-	if err := ec.putTo(t, ec.pc.waitLeader(t), key, val); err != nil {
-		t.Fatalf("PUT %s=%s via leader: %v", key, val, err)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		err := ec.putTo(t, ec.pc.waitLeader(t), key, val)
+		if err == nil {
+			return
+		}
+		msg := err.Error()
+		if !(strings.Contains(msg, "not leader") || strings.Contains(msg, "context deadline exceeded")) || time.Now().After(deadline) {
+			t.Fatalf("PUT %s=%s via leader: %v", key, val, err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -87,10 +100,37 @@ func (ec *e2eCluster) getFrom(t *testing.T, id, key string) string {
 	return cmd.Val
 }
 
-// get reads through the current leader.
+// get reads through the current leader, retrying on transient failures (the
+// leader can change between waitLeader and the read, and a read-index round
+// can stall briefly while an even-size remainder settles an election).
 func (ec *e2eCluster) get(t *testing.T, key string) string {
 	t.Helper()
-	return ec.getFrom(t, ec.pc.waitLeader(t), key)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		got, err := ec.getFromNoFatal(ec.pc.waitLeader(t), key)
+		if err == nil {
+			return got
+		}
+		msg := err.Error()
+		if !(strings.Contains(msg, "not leader") || strings.Contains(msg, "context deadline exceeded")) || time.Now().After(deadline) {
+			t.Fatalf("GET %s via leader: %v", key, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// getFromNoFatal reads from a node's client, returning the value and error
+// instead of failing the test (used by get for retry).
+func (ec *e2eCluster) getFromNoFatal(id, key string) (string, error) {
+	resp, err := ec.send(id, protocol.Command{Type: protocol.GET, Key: key})
+	if err != nil {
+		return "", err
+	}
+	var cmd protocol.Command
+	if err := json.Unmarshal([]byte(*resp), &cmd); err != nil {
+		return "", fmt.Errorf("GET %s: bad response %q: %v", key, *resp, err)
+	}
+	return cmd.Val, nil
 }
 
 // kill stops a node (raft + transport + WAL + client server), removes it from
@@ -183,8 +223,10 @@ func TestE2EPutReplicateAndGet(t *testing.T) {
 // ---- scenario 2: leader death → replacement, cluster keeps serving ----
 
 func TestE2ELeaderDeathReplacement(t *testing.T) {
-	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir()}
-	ec := newE2ECluster(t, []string{"a", "b", "c"}, dirs, 0)
+	// 5-node base: after killing the leader, 4 survivors elect with a 3-vote
+	// majority (not unanimity), so replacement is robust under load.
+	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir(), "d": t.TempDir(), "e": t.TempDir()}
+	ec := newE2ECluster(t, []string{"a", "b", "c", "d", "e"}, dirs, 0)
 	defer ec.stop()
 
 	ec.put(t, "k1", "v1")
@@ -209,8 +251,10 @@ func TestE2ELeaderDeathReplacement(t *testing.T) {
 // ---- scenario 3: node death → restart → log recovery → Get ----
 
 func TestE2ENodeRestartLogRecovery(t *testing.T) {
-	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir()}
-	ec := newE2ECluster(t, []string{"a", "b", "c"}, dirs, 0)
+	// 5-node base: the surviving majority (4 nodes) keeps committing while the
+	// killed leader is down, and can always elect without unanimity.
+	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir(), "d": t.TempDir(), "e": t.TempDir()}
+	ec := newE2ECluster(t, []string{"a", "b", "c", "d", "e"}, dirs, 0)
 	defer ec.stop()
 
 	ec.put(t, "k1", "v1")

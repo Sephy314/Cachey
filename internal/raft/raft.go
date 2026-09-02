@@ -507,6 +507,19 @@ func (n *Node) HandleAppendEntries(args *AppendEntries) *AppendEntriesReply {
 			if n.log.termAt(idx) != e.Term {
 				n.log.truncate(idx)
 				n.log.append(e)
+				// We are overwriting entries at or below what we already
+				// applied. This happens when this node, before learning its
+				// real membership, briefly self-elected as a standalone and
+				// appended no-op entries after its snapshot base; the genuine
+				// leader's entries now replace them. Roll the apply position
+				// back so the corrected entries are (re)applied — otherwise
+				// the state machine silently misses the real committed data.
+				if idx <= n.lastApplied {
+					n.lastApplied = idx - 1
+				}
+				if n.commitIndex >= idx {
+					n.commitIndex = idx - 1
+				}
 			}
 		} else {
 			n.log.append(e)
@@ -692,6 +705,17 @@ func (n *Node) applyCommittedLocked() {
 // set and reconciles leader bookkeeping (dropping removed servers, keeping
 // joining members that were promoted to voters).
 func (n *Node) applyConfigLocked(cfg *Configuration) {
+	// Learn transport addresses of members introduced by this change so we can
+	// reach them even if we later become the leader. Without this, a member
+	// added while another node led is orphaned once leadership moves (the new
+	// leader never learned its address).
+	if pr, ok := n.tr.(PeerRegistrar); ok {
+		for id, addr := range cfg.Addrs {
+			if addr != "" {
+				pr.RegisterPeer(id, addr)
+			}
+		}
+	}
 	oldPeers := n.peers
 	// n.peers stores only the OTHER voters; adopt the full config minus self.
 	var newPeers []string
@@ -769,10 +793,15 @@ func (n *Node) AddServer(ctx context.Context, id, addr string) error {
 	n.joining[id] = true
 	n.nextIndex[id] = 1
 	n.matchIndex[id] = 0
-	// Configuration carries the full voter set, including this node.
+	// Configuration carries the full voter set, including this node, plus the
+	// new member's address so every node can reach it (see Configuration).
 	voters := append([]string{n.id}, n.peers...)
 	voters = append(voters, id)
-	idx, err := n.appendEntryLocked(Entry{Term: n.currentTerm, Config: &Configuration{Voters: voters}})
+	cfg := &Configuration{Voters: voters}
+	if addr != "" {
+		cfg.Addrs = map[string]string{id: addr}
+	}
+	idx, err := n.appendEntryLocked(Entry{Term: n.currentTerm, Config: cfg})
 	n.mu.Unlock()
 	if err != nil {
 		return err

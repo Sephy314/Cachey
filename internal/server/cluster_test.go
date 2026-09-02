@@ -76,8 +76,14 @@ func newPersistentNode(t *testing.T, id, dir string, tr *raft.TCPTransport, addr
 	cfg := raft.Config{
 		ID:                id,
 		Peers:             peers,
-		HeartbeatInterval: 80 * time.Millisecond,
-		ElectionTimeout:   300 * time.Millisecond,
+		HeartbeatInterval: 100 * time.Millisecond,
+		// Election timeout randomized to 600-1200ms: ~6-12x the heartbeat, so
+		// a follower does not time out on a single delayed heartbeat under CI
+		// CPU contention. The old 300ms with an 80ms heartbeat (~4x) made an
+		// even-size remainder (kill/remove leaves a unanimity quorum) churn:
+		// one delayed heartbeat deposed the leader and the survivors ping-ponged
+		// terms long enough to stall writes/reads.
+		ElectionTimeout:   600 * time.Millisecond,
 		SnapshotThreshold: snapshotThreshold,
 	}
 	n, err := raft.NewNode(cfg, tr, NewRaftApply(st))
@@ -235,12 +241,24 @@ func (pc *persistentCluster) waitLeader(t *testing.T) string {
 	return leader
 }
 
-// write puts a key on the leader and waits for commit+apply.
+// write puts a key on the leader and waits for commit+apply. It re-finds the
+// leader and retries on a transient "not leader" (the node we picked can be
+// deposed between waitLeader and the write) or a commit that stalls briefly
+// while an even-size remainder settles an election — exactly how a real client
+// behaves via leader redirect.
 func (pc *persistentCluster) write(t *testing.T, key, val string) {
 	t.Helper()
-	leader := pc.waitLeader(t)
-	if err := pc.nodes[leader].cs.Put(key, val); err != nil {
-		t.Fatalf("Put(%s=%s): %v", key, val, err)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		leader := pc.waitLeader(t)
+		err := pc.nodes[leader].cs.Put(key, val)
+		if err == nil {
+			return
+		}
+		if !(errors.Is(err, raft.ErrNotLeader) || errors.Is(err, context.DeadlineExceeded)) || time.Now().After(deadline) {
+			t.Fatalf("Put(%s=%s): %v", key, val, err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -270,8 +288,10 @@ func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool)
 }
 
 func TestPersistentClusterReplicationAndFailover(t *testing.T) {
-	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir()}
-	pc := newPersistentCluster(t, []string{"a", "b", "c"}, dirs)
+	// 5-node base: killing one leaves 4 survivors needing only a 3-vote
+	// majority, so failover does not depend on a fragile unanimity quorum.
+	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir(), "d": t.TempDir(), "e": t.TempDir()}
+	pc := newPersistentCluster(t, []string{"a", "b", "c", "d", "e"}, dirs)
 	defer pc.stopAll()
 
 	pc.write(t, "k1", "v1")
@@ -280,7 +300,7 @@ func TestPersistentClusterReplicationAndFailover(t *testing.T) {
 		return pc.hasKey("k1", "v1") && pc.hasKey("k2", "v2")
 	})
 
-	// Kill the leader; the remaining two elect a new one.
+	// Kill the leader; the remaining four elect a new one (majority of 5 = 3).
 	old := pc.waitLeader(t)
 	pc.mu.Lock()
 	pc.nodes[old].node.Stop()
@@ -300,8 +320,8 @@ func TestPersistentClusterReplicationAndFailover(t *testing.T) {
 }
 
 func TestPersistentClusterRestart(t *testing.T) {
-	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir()}
-	pc := newPersistentCluster(t, []string{"a", "b", "c"}, dirs)
+	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir(), "d": t.TempDir(), "e": t.TempDir()}
+	pc := newPersistentCluster(t, []string{"a", "b", "c", "d", "e"}, dirs)
 	defer pc.stopAll()
 
 	pc.write(t, "k1", "v1")

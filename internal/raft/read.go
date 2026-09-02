@@ -75,6 +75,7 @@ func (n *Node) confirmLeadership(ctx context.Context) error {
 	var mu sync.Mutex
 	done := make(chan struct{})
 	var wg sync.WaitGroup
+	steppedDown := false
 	for _, peer := range n.peers {
 		wg.Add(1)
 		go func(peer string) {
@@ -83,11 +84,31 @@ func (n *Node) confirmLeadership(ctx context.Context) error {
 			if err != nil {
 				return
 			}
-			mu.Lock()
-			defer mu.Unlock()
+			// A higher term means this node is no longer the leader; step down
+			// and fail fast (ErrNotLeader) instead of waiting out the caller's
+			// context — a read during an election must redirect, not hang.
+			n.mu.Lock()
+			higher := reply.Term > n.currentTerm
+			if higher {
+				n.stepDownLocked(reply.Term)
+			}
+			n.mu.Unlock()
+			if higher {
+				mu.Lock()
+				steppedDown = true
+				mu.Unlock()
+				select {
+				case done <- struct{}{}:
+				default:
+				}
+				return
+			}
 			if reply.Success {
+				mu.Lock()
 				acks++
-				if acks >= majority {
+				ok := acks >= majority
+				mu.Unlock()
+				if ok {
 					select {
 					case done <- struct{}{}:
 					default:
@@ -102,7 +123,7 @@ func (n *Node) confirmLeadership(ctx context.Context) error {
 	case <-done:
 		n.mu.Lock()
 		defer n.mu.Unlock()
-		if n.role != RoleLeader {
+		if steppedDown || n.role != RoleLeader {
 			return ErrNotLeader
 		}
 		return nil

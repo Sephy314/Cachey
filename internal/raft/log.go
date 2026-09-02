@@ -5,6 +5,13 @@ package raft
 // configuration, applied (and effective for majorities) only once committed.
 type Configuration struct {
 	Voters []string `json:"voters"`
+	// Addrs carries the transport addresses of members introduced by this
+	// change. Only the leader that proposes the change knows the new member's
+	// address; shipping it in the configuration lets every node register the
+	// address when it applies the change, so any node can still reach the new
+	// member after a leadership change (otherwise the member is orphaned: a
+	// later leader cannot replicate to or request votes from it).
+	Addrs map[string]string `json:"addrs,omitempty"`
 }
 
 // Entry is one replicated log entry. Term is the term in which the leader
