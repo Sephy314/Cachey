@@ -183,6 +183,41 @@ func (pc *persistentCluster) restart(t *testing.T, id string) {
 	pc.nodes[id] = cn
 }
 
+// leaderID returns the current single leader id, or "" if none is elected or
+// the view is ambiguous. Unlike waitLeader it never fails the test.
+func (pc *persistentCluster) leaderID() string {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	return pc.leaderIDLocked("")
+}
+
+// leaderIDExcept returns the single leader among the nodes other than the
+// excluded id (used while a stale leader is partitioned but still running), or
+// "" if none / ambiguous.
+func (pc *persistentCluster) leaderIDExcept(excluded string) string {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	return pc.leaderIDLocked(excluded)
+}
+
+func (pc *persistentCluster) leaderIDLocked(excluded string) string {
+	var leader string
+	leaders := 0
+	for id, cn := range pc.nodes {
+		if id == excluded {
+			continue
+		}
+		if cn.node.IsLeader() {
+			leader = id
+			leaders++
+		}
+	}
+	if leaders != 1 {
+		return ""
+	}
+	return leader
+}
+
 // waitLeader returns the cluster's single leader id.
 func (pc *persistentCluster) waitLeader(t *testing.T) string {
 	t.Helper()

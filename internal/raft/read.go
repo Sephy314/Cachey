@@ -24,7 +24,10 @@ func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
 			n.mu.Unlock()
 			return 0, err
 		}
-		n.commitCond.Wait()
+		if err := n.pollWake(ctx); err != nil {
+			n.mu.Unlock()
+			return 0, err
+		}
 	}
 	readIdx := n.commitIndex
 	n.mu.Unlock()
@@ -39,7 +42,9 @@ func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
-		n.commitCond.Wait()
+		if err := n.pollWake(ctx); err != nil {
+			return 0, err
+		}
 	}
 	return readIdx, nil
 }

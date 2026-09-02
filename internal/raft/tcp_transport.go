@@ -42,6 +42,29 @@ type TCPTransport struct {
 	connMu    sync.Mutex
 	stopCh    chan struct{}
 	doneCh    chan struct{}
+
+	// fault, when non-nil, drops outbound RPCs from this node to a target
+	// (network-partition simulation for tests).
+	fault func(from, to string) bool
+}
+
+// SetFaultInjector installs a predicate that drops outbound RPCs: given this
+// node's ID and the destination peer's ID it returns true to simulate a
+// network partition. Pass nil to disable.
+func (t *TCPTransport) SetFaultInjector(fn func(from, to string) bool) {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	t.fault = fn
+}
+
+// partitioned reports whether an RPC from this node to peer should be dropped.
+func (t *TCPTransport) partitioned(peer string) bool {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	if t.fault == nil || t.node == nil {
+		return false
+	}
+	return t.fault(t.node.ID(), peer)
 }
 
 // NewTCPTransport creates a transport for node. peerAddrs maps peer ID to its
@@ -73,6 +96,8 @@ func (t *TCPTransport) RegisterPeer(id, addr string) {
 
 // SetNode wires the local raft node that inbound RPCs are dispatched to.
 func (t *TCPTransport) SetNode(n *Node) {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
 	t.node = n
 }
 
@@ -133,7 +158,10 @@ func (t *TCPTransport) dispatch(line []byte) ([]byte, error) {
 	if err := json.Unmarshal(line, &wm); err != nil {
 		return nil, err
 	}
-	if t.node == nil {
+	t.connMu.Lock()
+	node := t.node
+	t.connMu.Unlock()
+	if node == nil {
 		return nil, errors.New("raft: transport has no node")
 	}
 	var out []byte
@@ -143,7 +171,7 @@ func (t *TCPTransport) dispatch(line []byte) ([]byte, error) {
 		if err := json.Unmarshal(wm.Data, &args); err != nil {
 			return nil, err
 		}
-		b, err := encodeMsg(kindRequestVoteReply, t.node.HandleRequestVote(&args))
+		b, err := encodeMsg(kindRequestVoteReply, node.HandleRequestVote(&args))
 		if err != nil {
 			return nil, err
 		}
@@ -153,7 +181,7 @@ func (t *TCPTransport) dispatch(line []byte) ([]byte, error) {
 		if err := json.Unmarshal(wm.Data, &args); err != nil {
 			return nil, err
 		}
-		b, err := encodeMsg(kindAppendEntriesReply, t.node.HandleAppendEntries(&args))
+		b, err := encodeMsg(kindAppendEntriesReply, node.HandleAppendEntries(&args))
 		if err != nil {
 			return nil, err
 		}
@@ -163,7 +191,7 @@ func (t *TCPTransport) dispatch(line []byte) ([]byte, error) {
 		if err := json.Unmarshal(wm.Data, &args); err != nil {
 			return nil, err
 		}
-		b, err := encodeMsg(kindInstallSnapReply, t.node.HandleInstallSnapshot(&args))
+		b, err := encodeMsg(kindInstallSnapReply, node.HandleInstallSnapshot(&args))
 		if err != nil {
 			return nil, err
 		}
@@ -208,6 +236,9 @@ func (t *TCPTransport) SendInstallSnapshot(ctx context.Context, peer string, arg
 }
 
 func (t *TCPTransport) roundTrip(ctx context.Context, peer, reqKind string, req, reply any, replyKind string) error {
+	if t.partitioned(peer) {
+		return errors.New("raft: partitioned")
+	}
 	pc, err := t.peerConn(peer)
 	if err != nil {
 		return err

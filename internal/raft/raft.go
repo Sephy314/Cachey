@@ -61,7 +61,6 @@ type Node struct {
 	onRole  func(Role, uint64) // notifies leadership transitions
 
 	mu          sync.Mutex
-	commitCond  *sync.Cond
 	role        Role
 	currentTerm uint64
 	votedFor    string
@@ -142,7 +141,6 @@ func NewNode(cfg Config, tr Transport, applyFn func(Entry)) (*Node, error) {
 		doneCh:            make(chan struct{}),
 		rng:               rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
-	n.commitCond = sync.NewCond(&n.mu)
 	return n, nil
 }
 
@@ -280,7 +278,6 @@ func (n *Node) heartbeatLoop() {
 				n.noopIndex = 0
 				n.pendingStepDown = false
 				n.notifyRoleLocked()
-				n.commitCond.Broadcast()
 				n.mu.Unlock()
 				continue
 			}
@@ -422,7 +419,6 @@ func (n *Node) stepDownLocked(term uint64) {
 	n.leaderID = ""
 	n.noopIndex = 0
 	n.notifyRoleLocked()
-	n.commitCond.Broadcast() // wake any reader waiting on the no-op
 }
 
 func (n *Node) notifyRoleLocked() {
@@ -560,9 +556,25 @@ func (n *Node) WaitApplied(ctx context.Context, idx uint64) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		n.commitCond.Wait()
+		if err := n.pollWake(ctx); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// pollWake releases the node lock, waits briefly (or until ctx is done), then
+// re-acquires the lock. Must be called with n.mu held. Used to poll for state
+// changes while remaining context-cancellable — sync.Cond.Wait is not, which
+// would let a leader that cannot reach a quorum hang past its deadline.
+func (n *Node) pollWake(ctx context.Context) error {
+	n.mu.Unlock()
+	select {
+	case <-time.After(2 * time.Millisecond):
+	case <-ctx.Done():
+	}
+	n.mu.Lock()
+	return ctx.Err()
 }
 
 func (n *Node) broadcastAppendEntries() {
@@ -665,7 +677,6 @@ func (n *Node) applyCommittedLocked() {
 			n.maybeCompactLocked()
 		}
 	}
-	n.commitCond.Broadcast()
 }
 
 // applyConfigLocked adopts a committed configuration: it replaces the voter
