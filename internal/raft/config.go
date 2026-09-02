@@ -12,4 +12,7 @@ type Config struct {
 	// ElectionTimeout is the base follower timeout; the actual timeout is
 	// randomized to base..2*base to avoid split votes.
 	ElectionTimeout time.Duration
+	// SnapshotThreshold is the log length (entries after the compaction base)
+	// that triggers a snapshot + log compaction (Raft §7).
+	SnapshotThreshold uint64
 }

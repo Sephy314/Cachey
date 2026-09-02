@@ -96,6 +96,12 @@ func (n *Node) ApplyRecoveredRecord(rec wal.Record) error {
 	}
 	entry.Term = rec.Term
 	n.mu.Lock()
+	// Records at or before the compaction base are already covered by a
+	// restored snapshot.
+	if rec.RaftIndex <= n.log.baseIndex() {
+		n.mu.Unlock()
+		return nil
+	}
 	n.log.set(rec.RaftIndex, entry)
 	// Adopt the voter set from the last config entry in the recovered log
 	// (n.peers stores only the other voters).

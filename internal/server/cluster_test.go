@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -27,17 +29,25 @@ type clusterNode struct {
 }
 
 type persistentCluster struct {
-	mu    sync.Mutex
-	nodes map[string]*clusterNode
-	addrs map[string]string
-	ids   []string
+	mu                sync.Mutex
+	nodes             map[string]*clusterNode
+	addrs             map[string]string
+	ids               []string
+	snapshotThreshold uint64
 }
 
 // newPersistentCluster starts a raft cluster over TCP with WAL persistence.
 // dirs maps node id to its WAL directory (reuse a dir to test restart).
 func newPersistentCluster(t *testing.T, ids []string, dirs map[string]string) *persistentCluster {
+	return newPersistentClusterThreshold(t, ids, dirs, 0)
+}
+
+// newPersistentClusterThreshold is newPersistentCluster with a raft log
+// compaction threshold (entries after the snapshot base that trigger a
+// snapshot).
+func newPersistentClusterThreshold(t *testing.T, ids []string, dirs map[string]string, threshold uint64) *persistentCluster {
 	t.Helper()
-	pc := &persistentCluster{ids: ids}
+	pc := &persistentCluster{ids: ids, snapshotThreshold: threshold}
 	trs := make(map[string]*raft.TCPTransport)
 	pc.addrs = make(map[string]string)
 	pc.nodes = make(map[string]*clusterNode)
@@ -52,7 +62,7 @@ func newPersistentCluster(t *testing.T, ids []string, dirs map[string]string) *p
 		pc.addrs[id] = addr
 	}
 	for _, id := range ids {
-		pc.nodes[id] = newPersistentNode(t, id, dirs[id], trs[id], pc.addrs, otherIDs(id, pc.addrs))
+		pc.nodes[id] = newPersistentNode(t, id, dirs[id], trs[id], pc.addrs, otherIDs(id, pc.addrs), threshold)
 	}
 	for _, id := range ids {
 		pc.nodes[id].node.Run()
@@ -60,7 +70,7 @@ func newPersistentCluster(t *testing.T, ids []string, dirs map[string]string) *p
 	return pc
 }
 
-func newPersistentNode(t *testing.T, id, dir string, tr *raft.TCPTransport, addrs map[string]string, peers []string) *clusterNode {
+func newPersistentNode(t *testing.T, id, dir string, tr *raft.TCPTransport, addrs map[string]string, peers []string, snapshotThreshold uint64) *clusterNode {
 	t.Helper()
 	st := store.NewCacheyStore()
 	cfg := raft.Config{
@@ -68,10 +78,35 @@ func newPersistentNode(t *testing.T, id, dir string, tr *raft.TCPTransport, addr
 		Peers:             peers,
 		HeartbeatInterval: 50 * time.Millisecond,
 		ElectionTimeout:   200 * time.Millisecond,
+		SnapshotThreshold: snapshotThreshold,
 	}
 	n, err := raft.NewNode(cfg, tr, NewRaftApply(st))
 	if err != nil {
 		t.Fatalf("NewNode(%s): %v", id, err)
+	}
+	n.SetSnapshotCallbacks(
+		func() ([]byte, error) {
+			entries, err := st.Snapshot()
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(entries)
+		},
+		func(data []byte) error {
+			var entries []wal.SnapshotEntry
+			if err := json.Unmarshal(data, &entries); err != nil {
+				return err
+			}
+			return st.ApplySnapshot(entries)
+		},
+	)
+	n.SetSnapshotStore(raft.NewFileSnapshotStore(dir))
+	// Recovery order: restore a persisted snapshot (FSM + log base) before
+	// replaying the WAL so records at or before the snapshot are skipped.
+	if snap, ok, err := raft.NewFileSnapshotStore(dir).Load(); err == nil && ok {
+		if err := n.RestoreSnapshot(snap); err != nil {
+			t.Fatalf("restore snapshot (%s): %v", id, err)
+		}
 	}
 	wcfg := wal.DefaultConfig(dir)
 	wcfg.DisableRotation = true
@@ -143,7 +178,7 @@ func (pc *persistentCluster) restart(t *testing.T, id string) {
 			cn.tr.SetPeers(peerAddrsOf(peer, pc.addrs))
 		}
 	}
-	cn := newPersistentNode(t, id, old.dir, tr, pc.addrs, otherIDs(id, pc.addrs))
+	cn := newPersistentNode(t, id, old.dir, tr, pc.addrs, otherIDs(id, pc.addrs), pc.snapshotThreshold)
 	cn.node.Run()
 	pc.nodes[id] = cn
 }
@@ -351,7 +386,7 @@ func TestClusterAddServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	pc.addrs["c"] = cAddr
-	c := newPersistentNode(t, "c", t.TempDir(), tr, pc.addrs, nil)
+	c := newPersistentNode(t, "c", t.TempDir(), tr, pc.addrs, nil, pc.snapshotThreshold)
 	c.node.Run()
 	defer func() {
 		c.node.Stop()
@@ -413,20 +448,28 @@ func TestClusterRemoveServer(t *testing.T) {
 
 	pc.write(t, "k1", "v1")
 	leader := pc.waitLeader(t)
+	// Remove a follower deterministically (self-removal is covered separately).
+	var victim string
+	for id := range pc.nodes {
+		if id != leader {
+			victim = id
+			break
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := pc.nodes[leader].node.RemoveServer(ctx, "b"); err != nil {
+	if err := pc.nodes[leader].node.RemoveServer(ctx, victim); err != nil {
 		t.Fatalf("RemoveServer: %v", err)
 	}
 
-	// b is removed from the configuration on the remaining nodes.
-	waitFor(t, "b removed from the configuration", 15*time.Second, func() bool {
+	// victim is removed from the configuration on the remaining nodes.
+	waitFor(t, "victim removed from the configuration", 15*time.Second, func() bool {
 		for id, cn := range pc.nodes {
-			if id == "b" {
+			if id == victim {
 				continue
 			}
 			for _, v := range cn.node.Voters() {
-				if v == "b" {
+				if v == victim {
 					return false
 				}
 			}
@@ -434,16 +477,184 @@ func TestClusterRemoveServer(t *testing.T) {
 		return true
 	})
 
-	// Stop b; the remaining majority of 2 keeps serving.
+	// Stop the victim; the remaining majority of 2 keeps serving.
 	pc.mu.Lock()
-	pc.nodes["b"].node.Stop()
-	pc.nodes["b"].tr.Close()
-	pc.nodes["b"].wal.Close()
-	delete(pc.nodes, "b")
+	pc.nodes[victim].node.Stop()
+	pc.nodes[victim].tr.Close()
+	pc.nodes[victim].wal.Close()
+	delete(pc.nodes, victim)
 	pc.mu.Unlock()
 
 	pc.write(t, "k2", "v2")
 	waitFor(t, "remaining voters replicate after removal", 15*time.Second, func() bool {
 		return pc.hasKey("k2", "v2")
+	})
+}
+
+// TestClusterLeaderRemovesItself verifies that a leader removing itself still
+// propagates the committed configuration before stepping down.
+func TestClusterLeaderRemovesItself(t *testing.T) {
+	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir()}
+	pc := newPersistentCluster(t, []string{"a", "b", "c"}, dirs)
+	defer pc.stopAll()
+
+	pc.write(t, "k1", "v1")
+	leader := pc.waitLeader(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := pc.nodes[leader].node.RemoveServer(ctx, leader); err != nil {
+		t.Fatalf("leader self-removal: %v", err)
+	}
+
+	// The remaining two members learn the new configuration (leader removed).
+	waitFor(t, "remaining members apply the new configuration", 15*time.Second, func() bool {
+		for id, cn := range pc.nodes {
+			if id == leader {
+				continue
+			}
+			for _, v := range cn.node.Voters() {
+				if v == leader {
+					return false
+				}
+			}
+		}
+		return true
+	})
+
+	// They keep serving with a 2-node majority.
+	pc.mu.Lock()
+	pc.nodes[leader].node.Stop()
+	pc.nodes[leader].tr.Close()
+	pc.nodes[leader].wal.Close()
+	delete(pc.nodes, leader)
+	pc.mu.Unlock()
+	pc.write(t, "k2", "v2")
+	waitFor(t, "remaining members replicate after leader removal", 15*time.Second, func() bool {
+		return pc.hasKey("k2", "v2")
+	})
+}
+
+// TestClusterLogCompaction drives enough writes to trigger snapshot +
+// compaction, then verifies the log is truncated and data survives.
+func TestClusterLogCompaction(t *testing.T) {
+	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir()}
+	pc := newPersistentClusterThreshold(t, []string{"a", "b", "c"}, dirs, 5)
+	defer pc.stopAll()
+
+	leader := pc.waitLeader(t)
+	const n = 60
+	for i := 0; i < n; i++ {
+		pc.write(t, fmt.Sprintf("k%d", i), "v")
+	}
+
+	// The leader compacted its log (base advanced past the first writes).
+	waitFor(t, "leader log to be compacted", 15*time.Second, func() bool {
+		return pc.nodes[leader].node.LogBase() > 0
+	})
+	if base := pc.nodes[leader].node.LogBase(); base < n/2 {
+		t.Fatalf("leader log base = %d, want it past the snapshot point", base)
+	}
+
+	// Every key survives on every node.
+	waitFor(t, "all keys present after compaction", 15*time.Second, func() bool {
+		for i := 0; i < n; i++ {
+			if !pc.hasKey(fmt.Sprintf("k%d", i), "v") {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// TestClusterInstallSnapshotCatchUp verifies a brand-new member that joins
+// after the leader has compacted catches up via InstallSnapshot.
+func TestClusterInstallSnapshotCatchUp(t *testing.T) {
+	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir()}
+	pc := newPersistentClusterThreshold(t, []string{"a", "b"}, dirs, 5)
+	defer pc.stopAll()
+
+	leader := pc.waitLeader(t)
+	const n = 60
+	for i := 0; i < n; i++ {
+		pc.write(t, fmt.Sprintf("k%d", i), "v")
+	}
+	waitFor(t, "leader log to be compacted", 15*time.Second, func() bool {
+		return pc.nodes[leader].node.LogBase() > 0
+	})
+
+	// A fresh joiner with an empty log must be caught up via InstallSnapshot.
+	tr := raft.NewTCPTransport(nil)
+	cAddr, err := tr.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc.addrs["c"] = cAddr
+	c := newPersistentNode(t, "c", t.TempDir(), tr, pc.addrs, nil, pc.snapshotThreshold)
+	c.node.Run()
+	defer func() {
+		c.node.Stop()
+		c.tr.Close()
+		c.wal.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := pc.nodes[leader].node.AddServer(ctx, "c", cAddr); err != nil {
+		t.Fatalf("AddServer: %v", err)
+	}
+	waitFor(t, "joiner catches up via snapshot and entries", 15*time.Second, func() bool {
+		if len(c.node.Voters()) != 3 {
+			return false
+		}
+		for i := 0; i < n; i++ {
+			got, err := c.store.Get(fmt.Sprintf("k%d", i))
+			if err != nil || *got != "v" {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// TestClusterRestartFromSnapshot verifies a restarted node recovers state from
+// a persisted snapshot plus the WAL tail.
+func TestClusterRestartFromSnapshot(t *testing.T) {
+	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir()}
+	pc := newPersistentClusterThreshold(t, []string{"a", "b", "c"}, dirs, 5)
+	defer pc.stopAll()
+
+	leader := pc.waitLeader(t)
+	const n = 60
+	for i := 0; i < n; i++ {
+		pc.write(t, fmt.Sprintf("k%d", i), "v")
+	}
+	waitFor(t, "leader log to be compacted", 15*time.Second, func() bool {
+		return pc.nodes[leader].node.LogBase() > 0
+	})
+
+	// Crash and restart a follower from the same dir; it recovers the snapshot
+	// + WAL tail and rejoins.
+	var victim string
+	for id, cn := range pc.nodes {
+		if !cn.node.IsLeader() {
+			victim = id
+			break
+		}
+	}
+	pc.mu.Lock()
+	pc.nodes[victim].node.Stop()
+	pc.nodes[victim].wal.Close()
+	pc.mu.Unlock()
+	pc.restart(t, victim)
+
+	waitFor(t, "restarted node recovers from snapshot", 15*time.Second, func() bool {
+		for i := 0; i < n; i++ {
+			got, err := pc.nodes[victim].store.Get(fmt.Sprintf("k%d", i))
+			if err != nil || *got != "v" {
+				return false
+			}
+		}
+		return true
 	})
 }

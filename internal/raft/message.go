@@ -29,3 +29,18 @@ type AppendEntriesReply struct {
 	Term    uint64 `json:"term"`
 	Success bool   `json:"success"`
 }
+
+// InstallSnapshot sends a state-machine snapshot to a lagging follower whose
+// next needed log entry has been compacted away (Raft §7).
+type InstallSnapshot struct {
+	Term              uint64 `json:"term"`
+	LeaderID          string `json:"leader_id"`
+	LastIncludedIndex uint64 `json:"last_included_index"`
+	LastIncludedTerm  uint64 `json:"last_included_term"`
+	Data              []byte `json:"data"`
+}
+
+// InstallSnapshotReply is the follower's response.
+type InstallSnapshotReply struct {
+	Term uint64 `json:"term"`
+}

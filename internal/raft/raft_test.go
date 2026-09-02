@@ -58,6 +58,17 @@ func (t *memTransport) SendAppendEntries(_ context.Context, peer string, args *A
 	return target.HandleAppendEntries(args), nil
 }
 
+func (t *memTransport) SendInstallSnapshot(_ context.Context, peer string, args *InstallSnapshot) (*InstallSnapshotReply, error) {
+	if t.cluster.dropped(t.from, peer) {
+		return nil, errors.New("raft: test: message dropped")
+	}
+	target := t.cluster.node(peer)
+	if target == nil {
+		return nil, errors.New("raft: test: no such peer " + peer)
+	}
+	return target.HandleInstallSnapshot(args), nil
+}
+
 type cluster struct {
 	mu    sync.Mutex
 	nodes map[string]*Node

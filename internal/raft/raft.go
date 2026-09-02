@@ -47,6 +47,8 @@ type Transport interface {
 	SendRequestVote(ctx context.Context, peer string, args *RequestVote) (*RequestVoteReply, error)
 	// SendAppendEntries delivers entries to peer and returns its reply.
 	SendAppendEntries(ctx context.Context, peer string, args *AppendEntries) (*AppendEntriesReply, error)
+	// SendInstallSnapshot delivers a snapshot to peer and returns its reply.
+	SendInstallSnapshot(ctx context.Context, peer string, args *InstallSnapshot) (*InstallSnapshotReply, error)
 }
 
 // Node is a single Raft peer.
@@ -78,6 +80,20 @@ type Node struct {
 	// change commits (replicated to but not counted in majorities).
 	joining map[string]bool
 
+	// snapshot persistence + FSM snapshot callbacks (Raft §7)
+	snapshotStore     SnapshotStore
+	takeSnapshotFn    func() ([]byte, error)
+	applySnapshotFn   func([]byte) error
+	snapshotThreshold uint64
+
+	// pendingStepDown defers a leader's self-removal until its final heartbeat
+	// has propagated the committed configuration to the remaining members.
+	pendingStepDown bool
+	// removed marks a node that applied a configuration removing itself: it
+	// stays a passive follower (never campaigns, still grants votes so the
+	// remaining members can reach a quorum) until it is re-added.
+	removed bool
+
 	electionReset chan struct{}
 	stopOnce      sync.Once
 	stopCh        chan struct{}
@@ -107,20 +123,24 @@ func NewNode(cfg Config, tr Transport, applyFn func(Entry)) (*Node, error) {
 	if cfg.ElectionTimeout <= 0 {
 		cfg.ElectionTimeout = 500 * time.Millisecond
 	}
+	if cfg.SnapshotThreshold <= 0 {
+		cfg.SnapshotThreshold = 2000
+	}
 	n := &Node{
-		id:            cfg.ID,
-		peers:         cfg.Peers,
-		cfg:           cfg,
-		tr:            tr,
-		applyFn:       applyFn,
-		log:           NewLog(),
-		nextIndex:     make(map[string]uint64),
-		matchIndex:    make(map[string]uint64),
-		joining:       make(map[string]bool),
-		electionReset: make(chan struct{}, 1),
-		stopCh:        make(chan struct{}),
-		doneCh:        make(chan struct{}),
-		rng:           rand.New(rand.NewSource(time.Now().UnixNano())),
+		id:                cfg.ID,
+		peers:             cfg.Peers,
+		cfg:               cfg,
+		tr:                tr,
+		applyFn:           applyFn,
+		log:               NewLog(),
+		nextIndex:         make(map[string]uint64),
+		matchIndex:        make(map[string]uint64),
+		joining:           make(map[string]bool),
+		snapshotThreshold: cfg.SnapshotThreshold,
+		electionReset:     make(chan struct{}, 1),
+		stopCh:            make(chan struct{}),
+		doneCh:            make(chan struct{}),
+		rng:               rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 	n.commitCond = sync.NewCond(&n.mu)
 	return n, nil
@@ -240,9 +260,31 @@ func (n *Node) heartbeatLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			if n.IsLeader() {
-				n.broadcastAppendEntries()
+			n.mu.Lock()
+			isLeader := n.role == RoleLeader
+			pending := n.pendingStepDown
+			n.mu.Unlock()
+			if !isLeader {
+				continue
 			}
+			if pending {
+				// A leader that removed itself: synchronously push the final
+				// commit to the remaining members, then step down (the async
+				// broadcast would be cancelled by the step-down).
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				n.confirmLeadership(ctx)
+				cancel()
+				n.mu.Lock()
+				n.role = RoleFollower
+				n.leaderID = ""
+				n.noopIndex = 0
+				n.pendingStepDown = false
+				n.notifyRoleLocked()
+				n.commitCond.Broadcast()
+				n.mu.Unlock()
+				continue
+			}
+			n.broadcastAppendEntries()
 		case <-n.stopCh:
 			return
 		}
@@ -268,7 +310,7 @@ func (n *Node) resetElectionTimer() {
 func (n *Node) becomeCandidate() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.role == RoleLeader {
+	if n.role == RoleLeader || n.removed {
 		return false
 	}
 	n.role = RoleCandidate
@@ -437,6 +479,9 @@ func (n *Node) HandleAppendEntries(args *AppendEntries) *AppendEntriesReply {
 	if args.PrevLogIndex > n.log.lastIndex() {
 		return reply // log too short; leader will decrement nextIndex
 	}
+	if args.PrevLogIndex < n.log.baseIndex() {
+		return reply // entries before the compaction base are gone; leader sends a snapshot
+	}
 	if args.PrevLogIndex > 0 && n.log.termAt(args.PrevLogIndex) != args.PrevLogTerm {
 		return reply // conflict; leader will back off
 	}
@@ -536,6 +581,12 @@ func (n *Node) replicateTo(peer string) {
 		return
 	}
 	nextIdx := n.nextIndex[peer]
+	if nextIdx <= n.log.baseIndex() {
+		// The follower needs entries that were compacted away: send a snapshot.
+		n.mu.Unlock()
+		n.sendSnapshot(peer)
+		return
+	}
 	prevLogIndex := nextIdx - 1
 	prevLogTerm := n.log.termAt(prevLogIndex)
 	args := &AppendEntries{
@@ -611,6 +662,7 @@ func (n *Node) applyCommittedLocked() {
 			n.applyConfigLocked(e.Config)
 		case e.Command != nil && n.applyFn != nil:
 			n.applyFn(e)
+			n.maybeCompactLocked()
 		}
 	}
 	n.commitCond.Broadcast()
@@ -623,12 +675,16 @@ func (n *Node) applyConfigLocked(cfg *Configuration) {
 	oldPeers := n.peers
 	// n.peers stores only the OTHER voters; adopt the full config minus self.
 	var newPeers []string
+	included := false
 	for _, id := range cfg.Voters {
-		if id != n.id {
-			newPeers = append(newPeers, id)
+		if id == n.id {
+			included = true
+			continue
 		}
+		newPeers = append(newPeers, id)
 	}
 	n.peers = newPeers
+	n.removed = !included
 	if n.role == RoleLeader {
 		for _, id := range cfg.Voters {
 			if _, ok := n.nextIndex[id]; !ok {
@@ -651,10 +707,11 @@ func (n *Node) applyConfigLocked(cfg *Configuration) {
 			delete(n.matchIndex, id)
 		}
 	}
-	// A leader that removes itself from the cluster steps down once the
-	// change commits.
+	// A leader that removes itself defers the step-down until a final
+	// heartbeat has propagated the committed configuration to the remaining
+	// members (otherwise they never learn the commit index).
 	if n.role == RoleLeader && !n.isVoter(n.id) {
-		n.stepDownLocked(n.currentTerm)
+		n.pendingStepDown = true
 	}
 }
 
@@ -663,6 +720,13 @@ func (n *Node) Voters() []string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return append([]string{n.id}, n.peers...)
+}
+
+// LogBase returns the log compaction base (last included snapshot index).
+func (n *Node) LogBase() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.log.baseIndex()
 }
 
 // AddServer adds id (reachable at addr) to the cluster as a voting member
@@ -712,7 +776,9 @@ func (n *Node) RemoveServer(ctx context.Context, id string) error {
 		return fmt.Errorf("raft: %s is not a member", id)
 	}
 	voters := make([]string, 0, len(n.peers)+1)
-	voters = append(voters, n.id)
+	if id != n.id {
+		voters = append(voters, n.id)
+	}
 	for _, p := range n.peers {
 		if p != id {
 			voters = append(voters, p)

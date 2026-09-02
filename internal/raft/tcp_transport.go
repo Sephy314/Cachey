@@ -26,6 +26,8 @@ const (
 	kindRequestVoteReply   = "RequestVoteReply"
 	kindAppendEntries      = "AppendEntries"
 	kindAppendEntriesReply = "AppendEntriesReply"
+	kindInstallSnapshot    = "InstallSnapshot"
+	kindInstallSnapReply   = "InstallSnapshotReply"
 )
 
 // TCPTransport implements Transport over TCP with newline-delimited JSON
@@ -156,6 +158,16 @@ func (t *TCPTransport) dispatch(line []byte) ([]byte, error) {
 			return nil, err
 		}
 		out = b
+	case kindInstallSnapshot:
+		var args InstallSnapshot
+		if err := json.Unmarshal(wm.Data, &args); err != nil {
+			return nil, err
+		}
+		b, err := encodeMsg(kindInstallSnapReply, t.node.HandleInstallSnapshot(&args))
+		if err != nil {
+			return nil, err
+		}
+		out = b
 	default:
 		return nil, errors.New("raft: unknown message kind " + wm.Kind)
 	}
@@ -186,6 +198,12 @@ func (t *TCPTransport) SendRequestVote(ctx context.Context, peer string, args *R
 func (t *TCPTransport) SendAppendEntries(ctx context.Context, peer string, args *AppendEntries) (*AppendEntriesReply, error) {
 	var reply AppendEntriesReply
 	err := t.roundTrip(ctx, peer, kindAppendEntries, args, &reply, kindAppendEntriesReply)
+	return &reply, err
+}
+
+func (t *TCPTransport) SendInstallSnapshot(ctx context.Context, peer string, args *InstallSnapshot) (*InstallSnapshotReply, error) {
+	var reply InstallSnapshotReply
+	err := t.roundTrip(ctx, peer, kindInstallSnapshot, args, &reply, kindInstallSnapReply)
 	return &reply, err
 }
 
