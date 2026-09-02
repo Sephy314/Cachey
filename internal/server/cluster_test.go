@@ -76,8 +76,8 @@ func newPersistentNode(t *testing.T, id, dir string, tr *raft.TCPTransport, addr
 	cfg := raft.Config{
 		ID:                id,
 		Peers:             peers,
-		HeartbeatInterval: 50 * time.Millisecond,
-		ElectionTimeout:   200 * time.Millisecond,
+		HeartbeatInterval: 80 * time.Millisecond,
+		ElectionTimeout:   300 * time.Millisecond,
 		SnapshotThreshold: snapshotThreshold,
 	}
 	n, err := raft.NewNode(cfg, tr, NewRaftApply(st))
@@ -222,7 +222,7 @@ func (pc *persistentCluster) leaderIDLocked(excluded string) string {
 func (pc *persistentCluster) waitLeader(t *testing.T) string {
 	t.Helper()
 	var leader string
-	waitFor(t, "a leader to be elected", 115*time.Second, func() bool {
+	waitFor(t, "a leader to be elected", 30*time.Second, func() bool {
 		leaders := 0
 		for id, cn := range pc.nodes {
 			if cn.node.IsLeader() {
@@ -407,58 +407,59 @@ func TestClusterLinearizableReadAndRedirect(t *testing.T) {
 }
 
 func TestClusterAddServer(t *testing.T) {
-	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir()}
-	pc := newPersistentCluster(t, []string{"a", "b"}, dirs)
+	// Start from a stable 3-node cluster, then add a fresh 4th node.
+	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir()}
+	pc := newPersistentCluster(t, []string{"a", "b", "c"}, dirs)
 	defer pc.stopAll()
 
 	pc.write(t, "k1", "v1")
 	leader := pc.waitLeader(t)
 
-	// Fresh joiner node c: empty log, listening, unknown configuration.
+	// Fresh joiner node d: empty log, listening, unknown configuration.
 	tr := raft.NewTCPTransport(nil)
-	cAddr, err := tr.Listen("127.0.0.1:0")
+	dAddr, err := tr.Listen("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	pc.addrs["c"] = cAddr
-	c := newPersistentNode(t, "c", t.TempDir(), tr, pc.addrs, nil, pc.snapshotThreshold)
-	c.node.Run()
+	pc.addrs["d"] = dAddr
+	d := newPersistentNode(t, "d", t.TempDir(), tr, pc.addrs, nil, pc.snapshotThreshold)
+	d.node.Run()
 	defer func() {
-		c.node.Stop()
-		c.tr.Close()
-		c.wal.Close()
+		d.node.Stop()
+		d.tr.Close()
+		d.wal.Close()
 	}()
-	if voters := c.node.Voters(); len(voters) != 1 || voters[0] != "c" {
+	if voters := d.node.Voters(); len(voters) != 1 || voters[0] != "d" {
 		t.Fatalf("joiner starts with voters %v, want only itself", voters)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := pc.nodes[leader].node.AddServer(ctx, "c", cAddr); err != nil {
+	if err := pc.nodes[leader].node.AddServer(ctx, "d", dAddr); err != nil {
 		t.Fatalf("AddServer: %v", err)
 	}
 
-	// c catches up: learns the 3-voter config and the committed data.
+	// d catches up: learns the 4-voter config and the committed data.
 	waitFor(t, "joiner learns config and data", 15*time.Second, func() bool {
-		if len(c.node.Voters()) != 3 {
+		if len(d.node.Voters()) != 4 {
 			return false
 		}
-		got, err := c.store.Get("k1")
+		got, err := d.store.Get("k1")
 		return err == nil && *got == "v1"
 	})
 
 	// New writes replicate to the new member.
 	pc.mu.Lock()
-	pc.nodes["c"] = c
+	pc.nodes["d"] = d
 	pc.mu.Unlock()
 	pc.write(t, "k2", "v2")
 	waitFor(t, "new member replicates new writes", 15*time.Second, func() bool {
-		got, err := c.store.Get("k2")
+		got, err := d.store.Get("k2")
 		return err == nil && *got == "v2"
 	})
 
-	// c is a real voter: killing the leader leaves {b,c}, a majority of 2 that
-	// includes the new member, able to elect a new leader.
+	// d is a real voter: killing the leader leaves three voters (a majority of
+	// 4) that include the new member, able to elect a new leader.
 	pc.mu.Lock()
 	pc.nodes[leader].node.Stop()
 	pc.nodes[leader].tr.Close()
@@ -605,8 +606,11 @@ func TestClusterLogCompaction(t *testing.T) {
 // TestClusterInstallSnapshotCatchUp verifies a brand-new member that joins
 // after the leader has compacted catches up via InstallSnapshot.
 func TestClusterInstallSnapshotCatchUp(t *testing.T) {
-	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir()}
-	pc := newPersistentClusterThreshold(t, []string{"a", "b"}, dirs, 5)
+	// Use a 3-node cluster for the write + compaction phase (a majority of 3
+	// is stable under load), then join a fresh 4th node that must be caught up
+	// via InstallSnapshot after the leader has compacted.
+	dirs := map[string]string{"a": t.TempDir(), "b": t.TempDir(), "c": t.TempDir()}
+	pc := newPersistentClusterThreshold(t, []string{"a", "b", "c"}, dirs, 5)
 	defer pc.stopAll()
 
 	leader := pc.waitLeader(t)
@@ -624,8 +628,8 @@ func TestClusterInstallSnapshotCatchUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pc.addrs["c"] = cAddr
-	c := newPersistentNode(t, "c", t.TempDir(), tr, pc.addrs, nil, pc.snapshotThreshold)
+	pc.addrs["d"] = cAddr
+	c := newPersistentNode(t, "d", t.TempDir(), tr, pc.addrs, nil, pc.snapshotThreshold)
 	c.node.Run()
 	defer func() {
 		c.node.Stop()
@@ -635,11 +639,11 @@ func TestClusterInstallSnapshotCatchUp(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := pc.nodes[leader].node.AddServer(ctx, "c", cAddr); err != nil {
+	if err := pc.nodes[leader].node.AddServer(ctx, "d", cAddr); err != nil {
 		t.Fatalf("AddServer: %v", err)
 	}
 	waitFor(t, "joiner catches up via snapshot and entries", 15*time.Second, func() bool {
-		if len(c.node.Voters()) != 3 {
+		if len(c.node.Voters()) != 4 {
 			return false
 		}
 		for i := 0; i < n; i++ {

@@ -411,7 +411,10 @@ func (n *Node) tryBecomeLeader(term uint64) bool {
 	return true
 }
 
-// stepDownLocked converts the node to a follower of the (higher) term.
+// stepDownLocked converts the node to a follower of the (higher) term and
+// restarts its election timer so it does not immediately re-campaign (a
+// candidate whose term was just superseded must wait a fresh randomized
+// timeout; otherwise the cluster livelocks in endless escalating elections).
 func (n *Node) stepDownLocked(term uint64) {
 	n.currentTerm = term
 	n.role = RoleFollower
@@ -419,6 +422,7 @@ func (n *Node) stepDownLocked(term uint64) {
 	n.leaderID = ""
 	n.noopIndex = 0
 	n.notifyRoleLocked()
+	n.resetElectionTimer()
 }
 
 func (n *Node) notifyRoleLocked() {
@@ -443,6 +447,7 @@ func (n *Node) HandleRequestVote(args *RequestVote) *RequestVoteReply {
 		n.role = RoleFollower
 		n.leaderID = ""
 		n.notifyRoleLocked()
+		n.resetElectionTimer() // fresh timeout: don't immediately re-campaign
 	}
 	lastLogIndex := n.log.lastIndex()
 	lastLogTerm := n.log.lastTerm()
@@ -471,6 +476,10 @@ func (n *Node) HandleAppendEntries(args *AppendEntries) *AppendEntriesReply {
 	n.role = RoleFollower
 	n.leaderID = args.LeaderID
 	n.notifyRoleLocked()
+	// Any AppendEntries from a valid-term leader means there is a live leader;
+	// reset the election timer even on the reject paths below so a follower
+	// catching up never times out and disturbs the leader.
+	n.resetElectionTimer()
 
 	if args.PrevLogIndex > n.log.lastIndex() {
 		return reply // log too short; leader will decrement nextIndex
