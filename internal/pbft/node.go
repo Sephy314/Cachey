@@ -1,7 +1,8 @@
 // Package pbft implements a Practical Byzantine Fault Tolerance replica
 // (Castro & Liskov, "Practical Byzantine Fault Tolerance", OSDI '99). A
 // cluster of N = 3f+1 replicas stays correct while up to f of them misbehave
-// arbitrarily (Byzantine faults: lying, equivocating, going silent). This
+// arbitrarily (Byzantine faults: lying, equivocating, going silent).
+//
 // This file is the normal-case core: the pre-prepare / prepare / commit
 // protocol that totally orders client requests and applies them to a state
 // machine once a commit certificate (2f+1 matching commits) is reached.
@@ -387,6 +388,27 @@ func (n *Replica) WaitApplied(ctx context.Context, seq uint64) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for n.nextExec <= seq {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := n.pollWake(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WaitCaughtUp blocks until this replica has applied every request it has
+// ordered (nextExec has passed lastAssigned), so a read of its local FSM
+// reflects all writes acknowledged through it. Only the current view's primary
+// can serve such a read; followers get ErrNotPrimary so callers redirect.
+func (n *Replica) WaitCaughtUp(ctx context.Context) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if primaryID(n.all, n.view) != n.id {
+		return ErrNotPrimary
+	}
+	for n.nextExec <= n.lastAssigned {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
