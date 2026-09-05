@@ -89,6 +89,13 @@ func TestViewChangeLeadershipHandover(t *testing.T) {
 	waitFor(t, "r1 to become the view-1 primary", 3*time.Second, func() bool {
 		return nodes["r1"].View() == 1 && nodes["r1"].Primary() == "r1"
 	})
+	// The NEW-VIEW reaches the other replicas asynchronously; wait for all of
+	// them to enter view 1 so the old-primary check below is not a race.
+	for _, id := range []string{"r0", "r2", "r3"} {
+		waitFor(t, id+" to move to view 1", 3*time.Second, func() bool {
+			return nodes[id].View() == 1
+		})
+	}
 	// The old primary no longer accepts submissions; the new one does, and it
 	// must pick up at seq 3, not reuse seq 1 or 2.
 	if _, err := nodes["r0"].Submit([]byte("x")); err != ErrNotPrimary {
@@ -193,13 +200,17 @@ func TestByzantineReplicaStillEquivocatesAuthentically(t *testing.T) {
 	}
 }
 
-// preparedA_vs_mereB sets up the shared N=4 f=1 scenario behind the view-change
-// certificate tests: the Byzantine primary r0 equivocates at seq 1 — it
-// proposes A to r1 and r2 and backstops them with its own PREPARE so both hold
-// a GENUINE prepared certificate for A (but get only one commit each, so A
-// never commits and stays in the view-change range), and proposes a different
-// request B to r3, which merely knows B (accepted the pre-prepare, never
-// prepared). Verifies the preconditions and returns the two requests.
+// preparedA_vs_mereB sets up the shared N=4 f=1 scenario behind the
+// view-change certificate tests using a PBFT-correct prepared quorum (pre-
+// prepare + 2f prepares from DISTINCT BACKUPS). The Byzantine primary r0
+// equivocates at seq 1: it proposes A to the correct backups r1 and r2, and a
+// different request B to the Byzantine backup r3 (whose engine sits on B). The
+// Byzantine r3 nevertheless sends a genuine PREPARE for A under its own key, so
+// r1 and r2 each collect 2f=2 matching prepares from distinct backups (the
+// other correct backup + r3) and hold a VALID prepared certificate for A that
+// never relies on the primary — while nobody commits A (each gets only one
+// commit), so it stays in the view-change range. r3 merely knows B. Verifies
+// the preconditions and returns the two requests.
 func preparedA_vs_mereB(t *testing.T, nodes map[string]*Replica, fsms map[string]*fsm) (Request, Request) {
 	t.Helper()
 	reqA := Request{Client: "c", Timestamp: 21, Command: []byte("A")}
@@ -208,7 +219,8 @@ func preparedA_vs_mereB(t *testing.T, nodes map[string]*Replica, fsms map[string
 	if dA == dB {
 		t.Fatal("test digests collide")
 	}
-	// Byzantine primary r0 proposes A@1 to r1 and r2, B@1 to r3.
+	// Byzantine primary r0 proposes A@1 to the correct backups r1,r2 and B@1 to
+	// the Byzantine backup r3.
 	for _, to := range []string{"r1", "r2"} {
 		pp := &PrePrepare{View: 0, Seq: 1, Digest: dA, Req: reqA, Sender: "r0"}
 		pp.Sig = nodes["r0"].sign(pp)
@@ -217,12 +229,13 @@ func preparedA_vs_mereB(t *testing.T, nodes map[string]*Replica, fsms map[string
 	ppB := &PrePrepare{View: 0, Seq: 1, Digest: dB, Req: reqB, Sender: "r0"}
 	ppB.Sig = nodes["r0"].sign(ppB)
 	nodes["r3"].HandlePrePrepare(ppB)
-	// r0 backstops A with its own PREPARE so r1 and r2 each collect 2f=2
-	// matching prepares (the other backup + r0) and hold a prepared certificate
-	// for A — but only one commit each, so A is never committed.
+	// The Byzantine backup r3 sends a genuine PREPARE for A to r1 and r2, so
+	// each collects 2f=2 matching prepares from distinct backups (the other
+	// correct backup + r3) — no primary prepare involved. Only one commit each
+	// follows (r3 never commits A), so A is prepared but not committed.
 	for _, to := range []string{"r1", "r2"} {
-		p := &Prepare{View: 0, Seq: 1, Digest: dA, Sender: "r0"}
-		p.Sig = nodes["r0"].sign(p)
+		p := &Prepare{View: 0, Seq: 1, Digest: dA, Sender: "r3"}
+		p.Sig = nodes["r3"].sign(p)
 		nodes[to].HandlePrepare(p)
 	}
 	// r1 must be prepared for A but have executed nothing; r3 must merely know
@@ -256,18 +269,18 @@ func preparedA_vs_mereB(t *testing.T, nodes map[string]*Replica, fsms map[string
 
 // TestPreparedRequestNotDisplacedByMereReport pins the view-change safety
 // invariant behind the certificate preference in buildOEntriesLocked. A
-// Byzantine VIEW-CHANGE from r0 reports B too, so the merely-known B ties A at
-// two reports — but only A is certified. After the view change the NEW-VIEW
-// must re-propose the certified A at seq 1; the merely-known B must not
-// displace it, no matter how many replicas report B.
+// Byzantine VIEW-CHANGE from r0 reports the merely-known B too, so B is
+// reported by two replicas while only A is certified. After the view change the
+// NEW-VIEW must re-propose the certified A at seq 1; the merely-known B must
+// not displace it, no matter how many replicas report B.
 func TestPreparedRequestNotDisplacedByMereReport(t *testing.T) {
 	nodes, fsms := startCluster(t, []string{"r0", "r1", "r2", "r3"})
 	_, reqB := preparedA_vs_mereB(t, nodes, fsms)
 	dB := digestOf(reqB)
 
 	// Backups suspect. r1 is the view-1 primary; it must build O with the
-	// certified A even though B is reported by r3 and by r0's Byzantine
-	// VIEW-CHANGE below (B and A tie at two reports each).
+	// certified A even though B is reported by r0's Byzantine VIEW-CHANGE below
+	// and by r3's own (r3's engine is on B).
 	nodes["r1"].StartViewChange()
 	nodes["r2"].StartViewChange()
 	byzVC := &ViewChange{
@@ -286,34 +299,39 @@ func TestPreparedRequestNotDisplacedByMereReport(t *testing.T) {
 	}
 }
 
-// TestBogusPreparedClaimRejected pins the verifiable-certificate rule: a
-// Byzantine replica that asserts Prepared (a certificate) for a conflicting
-// request it cannot actually prove is not trusted. Here r0 claims B@1 was
-// prepared, but the attached certificate has only one authentic matching
-// prepare (fewer than 2f), so r1 must reject the VIEW-CHANGE outright and the
-// subsequent view change must still re-propose the genuinely certified A.
+// TestBogusPreparedClaimRejected pins the verifiable-certificate rule against
+// the primary double-vote too: a Byzantine replica that asserts a request was
+// prepared cannot prove it with the primary's vote alone. Here the Byzantine
+// backup r3 claims B@1 was prepared, but its certificate carries only prepares
+// it forged under r1/r2's names (invalid signatures — nobody actually prepared
+// B) plus a valid primary pre-prepare, so r1 must reject the VIEW-CHANGE and
+// the genuine view change must still re-propose the certified A.
 func TestBogusPreparedClaimRejected(t *testing.T) {
 	nodes, fsms := startCluster(t, []string{"r0", "r1", "r2", "r3"})
 	_, reqB := preparedA_vs_mereB(t, nodes, fsms)
 	dB := digestOf(reqB)
 
-	// r0's "certificate" for B: a valid pre-prepare (r0 is the view-0 primary)
-	// plus only one authentic prepare (from r3) — short of the 2f=2 needed.
+	// r3's "certificate" for B: a valid pre-prepare (from the view-0 primary)
+	// plus two PREPAREs forged under r1/r2's names but signed by r3 — signature
+	// verification must fail, so the certificate cannot prove B was prepared.
 	ppB := &PrePrepare{View: 0, Seq: 1, Digest: dB, Req: reqB, Sender: "r0"}
 	ppB.Sig = nodes["r0"].sign(ppB)
-	prepR3 := &Prepare{View: 0, Seq: 1, Digest: dB, Sender: "r3"}
-	prepR3.Sig = nodes["r3"].sign(prepR3)
+	forge := func(from string) *Prepare {
+		p := &Prepare{View: 0, Seq: 1, Digest: dB, Sender: from}
+		p.Sig = nodes["r3"].sign(p) // r3 signs as if it were `from`
+		return p
+	}
 	bogus := &ViewChange{
-		View: 1, S: 0, Sender: "r0",
+		View: 1, S: 0, Sender: "r3",
 		Entries: []ViewEntry{{
 			Seq: 1, Digest: dB, Req: reqB,
-			Cert: &PreparedCert{PrePrepare: ppB, Prepares: []*Prepare{prepR3}},
+			Cert: &PreparedCert{PrePrepare: ppB, Prepares: []*Prepare{forge("r1"), forge("r2")}},
 		}},
 	}
-	bogus.Sig = nodes["r0"].sign(bogus)
+	bogus.Sig = nodes["r3"].sign(bogus)
 	nodes["r1"].HandleViewChange(bogus)
 
-	// r1 (the view-1 primary) must reject the unverifiable certificate: r0 is
+	// r1 (the view-1 primary) must reject the unverifiable certificate: r3 is
 	// not counted toward the view change, so it cannot make B look prepared.
 	nodes["r1"].mu.Lock()
 	_, counted := nodes["r1"].viewChanges[1][bogus.Sender]
@@ -322,7 +340,7 @@ func TestBogusPreparedClaimRejected(t *testing.T) {
 		t.Fatal("r1 accepted a VIEW-CHANGE whose prepared certificate cannot be verified")
 	}
 
-	// The genuine view change by the correct backups converges on the certified A.
+	// The genuine view change by the replicas converges on the certified A.
 	nodes["r1"].StartViewChange()
 	nodes["r2"].StartViewChange()
 	nodes["r3"].StartViewChange()

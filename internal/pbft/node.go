@@ -475,6 +475,12 @@ func (n *Replica) HandlePrepare(m *Prepare) {
 	if !n.isPeer(m.Sender) {
 		return
 	}
+	if m.Sender == primaryID(n.all, m.View) {
+		// The view's primary votes with its pre-prepare, not a prepare; counting
+		// its prepare too would let it contribute twice (PBFT counts 2f prepares
+		// from distinct backups).
+		return
+	}
 	// A prepare for the current view is counted; one for the imminent view is
 	// buffered so it survives the view change (it would otherwise be lost to a
 	// peer that has not entered the new view yet — the same out-of-order

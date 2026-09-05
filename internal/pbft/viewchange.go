@@ -150,10 +150,17 @@ func (n *Replica) validCert(vc *ViewChange, en ViewEntry) bool {
 	if !verifyPayload(n.peerKeys[pp.Sender], pp.Sig, pp) {
 		return false
 	}
-	// At least 2f distinct authentic prepares must match the pre-prepare.
+	// At least 2f distinct authentic prepares must match the pre-prepare. PBFT
+	// counts prepares from distinct BACKUPS only: the view's primary already
+	// voted with its pre-prepare, and the certificate holder's own vote is the
+	// certificate itself, so neither may pad the quorum.
+	prim := primaryID(n.all, pp.View)
 	seen := make(map[string]bool, len(en.Cert.Prepares))
 	for _, p := range en.Cert.Prepares {
 		if p == nil || p.View != pp.View || p.Seq != pp.Seq || p.Digest != pp.Digest {
+			return false
+		}
+		if p.Sender == prim || p.Sender == vc.Sender {
 			return false
 		}
 		if !n.members[p.Sender] || seen[p.Sender] {
@@ -428,11 +435,16 @@ func (n *Replica) adoptNewViewPrePrepareLocked(pp PrePrepare) {
 	n.log[seq] = e
 	n.seen[reqKey{pp.Req.Client, pp.Req.Timestamp}] = d
 	n.dropConflictingPending(n.view, seq, d)
-	pr := &Prepare{View: n.view, Seq: seq, Digest: d, Sender: n.id}
-	pr.Sig = n.sign(pr)
-	n.broadcast(func(p string) {
-		_ = n.tr.SendPrepare(context.Background(), p, pr)
-	})
+	// Backups multicast a matching PREPARE for the new view's proposal. The new
+	// primary does not: it proposed via the O pre-prepare, so its vote is
+	// already counted (PBFT counts 2f prepares from distinct backups).
+	if primaryID(n.all, n.view) != n.id {
+		pr := &Prepare{View: n.view, Seq: seq, Digest: d, Sender: n.id}
+		pr.Sig = n.sign(pr)
+		n.broadcast(func(p string) {
+			_ = n.tr.SendPrepare(context.Background(), p, pr)
+		})
+	}
 	n.syncEntry(seq)
 }
 
