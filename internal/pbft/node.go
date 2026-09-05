@@ -14,6 +14,7 @@ package pbft
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"sort"
@@ -59,6 +60,12 @@ type Replica struct {
 	peers   []string        // peer replica ids (all except self)
 	f       int             // max byzantine faults tolerated: len(all) == 3f+1
 	tr      Transport
+	// priv is this replica's Ed25519 identity key (M3): it signs every message
+	// this replica sends. pub is its public half; peerKeys holds the verified
+	// public key of each peer.
+	priv     ed25519.PrivateKey
+	pub      ed25519.PublicKey
+	peerKeys map[string]ed25519.PublicKey
 
 	// applyFn executes one request, in sequence order, once the request is
 	// commit-certified. It runs while the node lock is held and must not call
@@ -179,6 +186,7 @@ func NewReplica(cfg Config, tr Transport, applyFn func(seq uint64, req Request))
 		f:               (len(all) - 1) / 3,
 		tr:              tr,
 		applyFn:         applyFn,
+		peerKeys:        make(map[string]ed25519.PublicKey),
 		viewChanges:     make(map[uint64]map[string]*ViewChange),
 		vcSent:          make(map[uint64]bool),
 		nvSent:          make(map[uint64]bool),
@@ -193,6 +201,15 @@ func NewReplica(cfg Config, tr Transport, applyFn func(seq uint64, req Request))
 		stopCh:          make(chan struct{}),
 		doneCh:          make(chan struct{}),
 	}
+	pub, priv, err := newKeyPair()
+	if err != nil {
+		return nil, fmt.Errorf("pbft: generating identity key: %w", err)
+	}
+	n.priv = priv
+	n.pub = pub
+	// A NEW-VIEW's collected view-changes include this replica's own, which it
+	// must be able to re-verify; register our own key too.
+	n.peerKeys[cfg.ID] = pub
 	return n, nil
 }
 
@@ -261,6 +278,34 @@ func (n *Replica) LastExecuted() uint64 {
 	return n.nextExec - 1
 }
 
+// PublicKey returns this replica's Ed25519 identity public key, which peers
+// must register via SetPeerKey before accepting this replica's messages.
+func (n *Replica) PublicKey() ed25519.PublicKey { return n.pub }
+
+// SetPeerKey registers the identity public key of a peer (the dynamic key
+// exchange / handshake outcome). Messages whose Sender has no registered key
+// are rejected.
+func (n *Replica) SetPeerKey(peer string, pub ed25519.PublicKey) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.peerKeys[peer] = pub
+}
+
+// sign returns this replica's signature over m (see signPayload).
+func (n *Replica) sign(m any) []byte {
+	return signPayload(n.priv, m)
+}
+
+// verify reports whether sig is this replica's recorded peer's signature over
+// m; an unregistered sender never verifies.
+func (n *Replica) verify(sender string, sig []byte, m any) bool {
+	pub, ok := n.peerKeys[sender]
+	if !ok {
+		return false
+	}
+	return verifyPayload(pub, sig, m)
+}
+
 // isPeer reports whether s is another replica in the cluster.
 func (n *Replica) isPeer(s string) bool {
 	return s != n.id && n.members[s]
@@ -315,6 +360,7 @@ func (n *Replica) Submit(command []byte) (uint64, error) {
 		return seq, nil
 	}
 	pp := &PrePrepare{View: n.view, Seq: seq, Digest: d, Req: req, Sender: n.id}
+	pp.Sig = n.sign(pp)
 	n.broadcast(func(p string) { _ = n.tr.SendPrePrepare(context.Background(), p, pp) })
 	return seq, nil
 }
@@ -345,6 +391,9 @@ func (n *Replica) WaitApplied(ctx context.Context, seq uint64) error {
 func (n *Replica) HandlePrePrepare(m *PrePrepare) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if !n.verify(m.Sender, m.Sig, m) {
+		return // unauthenticated: signature does not match the claimed sender
+	}
 	if !n.isPeer(m.Sender) || m.View != n.view {
 		return
 	}
@@ -384,6 +433,7 @@ func (n *Replica) HandlePrePrepare(m *PrePrepare) {
 	// at this sequence: they can never match what we accepted.
 	n.dropConflictingPending(n.view, m.Seq, d)
 	pr := &Prepare{View: n.view, Seq: m.Seq, Digest: d, Sender: n.id}
+	pr.Sig = n.sign(pr)
 	n.broadcast(func(p string) { _ = n.tr.SendPrepare(context.Background(), p, pr) })
 	n.syncEntry(m.Seq)
 }
@@ -411,6 +461,9 @@ func (n *Replica) dropConflictingPending(view, seq uint64, d string) {
 func (n *Replica) HandlePrepare(m *Prepare) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if !n.verify(m.Sender, m.Sig, m) {
+		return // unauthenticated
+	}
 	if !n.isPeer(m.Sender) {
 		return
 	}
@@ -439,6 +492,9 @@ func (n *Replica) HandlePrepare(m *Prepare) {
 func (n *Replica) HandleCommit(m *Commit) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if !n.verify(m.Sender, m.Sig, m) {
+		return // unauthenticated
+	}
 	if !n.isPeer(m.Sender) {
 		return
 	}
@@ -473,6 +529,7 @@ func (n *Replica) syncEntry(seq uint64) {
 	if len(e.prepares) >= 2*n.f && !e.sentCommit {
 		e.sentCommit = true
 		c := &Commit{View: n.view, Seq: seq, Digest: e.digest, Sender: n.id}
+		c.Sig = n.sign(c)
 		n.broadcast(func(p string) { _ = n.tr.SendCommit(context.Background(), p, c) })
 	}
 	if !e.sentCommit {

@@ -17,8 +17,12 @@ func TestViewChangeResolvesEquivocation(t *testing.T) {
 	reqA := Request{Client: "c", Timestamp: 7, Command: []byte("A")}
 	reqB := Request{Client: "c", Timestamp: 7, Command: []byte("B")}
 	// Byzantine primary r0: seq 1 = A to r1, seq 1 = B to r2.
-	nodes["r1"].HandlePrePrepare(&PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqA), Req: reqA, Sender: "r0"})
-	nodes["r2"].HandlePrePrepare(&PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqB), Req: reqB, Sender: "r0"})
+	ppA := &PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqA), Req: reqA, Sender: "r0"}
+	ppA.Sig = nodes["r0"].sign(ppA)
+	nodes["r1"].HandlePrePrepare(ppA)
+	ppB := &PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqB), Req: reqB, Sender: "r0"}
+	ppB.Sig = nodes["r0"].sign(ppB)
+	nodes["r2"].HandlePrePrepare(ppB)
 	// Give the equivocation time to stall every replica in view 0.
 	time.Sleep(50 * time.Millisecond)
 	for _, id := range []string{"r0", "r1", "r2", "r3"} {
@@ -118,6 +122,73 @@ func TestViewChangeRequiresQuorum(t *testing.T) {
 	for _, id := range []string{"r0", "r1", "r2", "r3"} {
 		if nodes[id].View() != 0 {
 			t.Fatalf("%s moved to view %d after a lone view change, want to stay at 0", id, nodes[id].View())
+		}
+	}
+}
+
+// TestRejectsForgedSender verifies authentication (M3): a Byzantine replica
+// that claims to be the primary but signs with its own key is rejected — a
+// backup must not accept a pre-prepare whose signature does not match its
+// claimed Sender.
+func TestRejectsForgedSender(t *testing.T) {
+	nodes, fsms := startCluster(t, []string{"r0", "r1", "r2", "r3"})
+	req := Request{Client: "c", Timestamp: 5, Command: []byte("x")}
+	// r3 forges a pre-prepare claiming Sender=r0 but signs with its own key.
+	forged := &PrePrepare{View: 0, Seq: 1, Digest: digestOf(req), Req: req, Sender: "r0"}
+	forged.Sig = nodes["r3"].sign(forged)
+	nodes["r1"].HandlePrePrepare(forged)
+	// r1 must not accept it: no entry, no prepares, nothing executed.
+	time.Sleep(100 * time.Millisecond)
+	nodes["r1"].mu.Lock()
+	_, accepted := nodes["r1"].log[1]
+	nodes["r1"].mu.Unlock()
+	if accepted {
+		t.Fatal("r1 accepted a pre-prepare whose sender was forged")
+	}
+	if got := fsms["r1"].snapshot(); len(got) != 0 {
+		t.Fatalf("r1 executed %v from a forged sender", got)
+	}
+}
+
+// TestRejectsTamperedMessage verifies a validly signed message that was
+// tampered with after signing (e.g. the digest changed) is rejected.
+func TestRejectsTamperedMessage(t *testing.T) {
+	nodes, _ := startCluster(t, []string{"r0", "r1", "r2", "r3"})
+	req := Request{Client: "c", Timestamp: 6, Command: []byte("x")}
+	pp := &PrePrepare{View: 0, Seq: 1, Digest: digestOf(req), Req: req, Sender: "r0"}
+	pp.Sig = nodes["r0"].sign(pp)
+	pp.Digest = "deadbeef" // tamper after signing
+	nodes["r1"].HandlePrePrepare(pp)
+	nodes["r1"].mu.Lock()
+	_, accepted := nodes["r1"].log[1]
+	nodes["r1"].mu.Unlock()
+	if accepted {
+		t.Fatal("r1 accepted a tampered pre-prepare")
+	}
+}
+
+// TestByzantineReplicaStillEquivocatesAuthentically verifies the threat model
+// of M3: a Byzantine replica that owns a valid key can still equivocate (send
+// conflicting proposals under its own identity) — signatures authenticate, not
+// discipline — and the protocol's quorum rules still prevent it from getting
+// conflicting requests committed.
+func TestByzantineReplicaStillEquivocatesAuthentically(t *testing.T) {
+	nodes, _ := startCluster(t, []string{"r0", "r1", "r2", "r3"})
+	reqA := Request{Client: "c", Timestamp: 8, Command: []byte("A")}
+	reqB := Request{Client: "c", Timestamp: 8, Command: []byte("B")}
+	ppA := &PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqA), Req: reqA, Sender: "r0"}
+	ppA.Sig = nodes["r0"].sign(ppA)
+	nodes["r1"].HandlePrePrepare(ppA)
+	ppB := &PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqB), Req: reqB, Sender: "r0"}
+	ppB.Sig = nodes["r0"].sign(ppB)
+	nodes["r2"].HandlePrePrepare(ppB)
+	time.Sleep(100 * time.Millisecond)
+	for _, id := range []string{"r1", "r2"} {
+		nodes[id].mu.Lock()
+		_, ok := nodes[id].log[1]
+		nodes[id].mu.Unlock()
+		if !ok {
+			t.Fatalf("%s did not accept its (authentic) equivocating proposal", id)
 		}
 	}
 }

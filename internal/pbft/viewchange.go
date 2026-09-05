@@ -39,6 +39,7 @@ func (n *Replica) startViewChangeLocked() {
 	}
 	n.vcSent[target] = true
 	vc := n.buildViewChangeLocked(target)
+	vc.Sig = n.sign(vc)
 	n.addViewChangeLocked(vc) // count ourselves
 	n.broadcast(func(p string) {
 		_ = n.tr.SendViewChange(context.Background(), p, vc)
@@ -77,6 +78,9 @@ func (n *Replica) addViewChangeLocked(vc *ViewChange) {
 func (n *Replica) HandleViewChange(m *ViewChange) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if !n.verify(m.Sender, m.Sig, m) {
+		return // unauthenticated
+	}
 	if !n.isPeer(m.Sender) {
 		return
 	}
@@ -118,6 +122,7 @@ func (n *Replica) maybeBuildNewViewLocked(target uint64) {
 		V = append(V, vc)
 	}
 	nv := &NewView{View: target, V: V, O: o, Sender: n.id}
+	nv.Sig = n.sign(nv)
 	n.broadcast(func(p string) {
 		_ = n.tr.SendNewView(context.Background(), p, nv)
 	})
@@ -193,6 +198,9 @@ func (n *Replica) buildOEntriesLocked(target uint64) []PrePrepare {
 func (n *Replica) HandleNewView(nv *NewView) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if !n.verify(nv.Sender, nv.Sig, nv) {
+		return // unauthenticated
+	}
 	if !n.isPeer(nv.Sender) || nv.Sender != primaryID(n.all, nv.View) {
 		return // only the view's primary sends NEW-VIEW
 	}
@@ -208,6 +216,9 @@ func (n *Replica) HandleNewView(nv *NewView) {
 		}
 		if !validViewChange(vc) {
 			return
+		}
+		if !n.verify(vc.Sender, vc.Sig, vc) {
+			return // every collected view-change must be authentic
 		}
 		senders[vc.Sender] = true
 	}
@@ -305,6 +316,7 @@ func (n *Replica) adoptNewViewPrePrepareLocked(pp PrePrepare) {
 	n.seen[reqKey{pp.Req.Client, pp.Req.Timestamp}] = d
 	n.dropConflictingPending(n.view, seq, d)
 	pr := &Prepare{View: n.view, Seq: seq, Digest: d, Sender: n.id}
+	pr.Sig = n.sign(pr)
 	n.broadcast(func(p string) {
 		_ = n.tr.SendPrepare(context.Background(), p, pr)
 	})

@@ -27,6 +27,7 @@ type PrePrepare struct {
 	Digest string  `json:"digest"`
 	Req    Request `json:"req"`
 	Sender string  `json:"sender"`
+	Sig    []byte  `json:"sig,omitempty"`
 }
 
 // Prepare certifies that the sender accepted the primary's proposal
@@ -37,6 +38,7 @@ type Prepare struct {
 	Seq    uint64 `json:"seq"`
 	Digest string `json:"digest"`
 	Sender string `json:"sender"`
+	Sig    []byte `json:"sig,omitempty"`
 }
 
 // Commit certifies that the sender reached a prepared certificate for the
@@ -48,6 +50,7 @@ type Commit struct {
 	Seq    uint64 `json:"seq"`
 	Digest string `json:"digest"`
 	Sender string `json:"sender"`
+	Sig    []byte `json:"sig,omitempty"`
 }
 
 // ViewEntry is one request a view-change sender still knows about (above its
@@ -69,6 +72,7 @@ type ViewChange struct {
 	S       uint64      `json:"s"`
 	Entries []ViewEntry `json:"entries,omitempty"`
 	Sender  string      `json:"sender"`
+	Sig     []byte      `json:"sig,omitempty"`
 }
 
 // NewView is sent by the new primary once it holds 2f+1 view-change messages
@@ -80,6 +84,7 @@ type NewView struct {
 	V      []*ViewChange `json:"v"`
 	O      []PrePrepare  `json:"o"`
 	Sender string        `json:"sender"`
+	Sig    []byte        `json:"sig,omitempty"`
 }
 
 // digestOf returns the canonical digest of a request: sha256 over its JSON

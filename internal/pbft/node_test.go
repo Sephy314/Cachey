@@ -111,7 +111,21 @@ func startCluster(t *testing.T, ids []string) (map[string]*Replica, map[string]*
 		nodes[id] = n
 		fsms[id] = f
 	}
+	wirePeerKeys(nodes)
 	return nodes, fsms
+}
+
+// wirePeerKeys registers every node's identity public key on every peer so
+// handlers accept their (signed) messages (M3 dynamic key exchange, done
+// out-of-band in tests).
+func wirePeerKeys(nodes map[string]*Replica) {
+	for id, n := range nodes {
+		for other := range nodes {
+			if other != id {
+				n.SetPeerKey(other, nodes[other].PublicKey())
+			}
+		}
+	}
 }
 
 // waitFor polls cond until it returns true or the timeout elapses.
@@ -241,6 +255,7 @@ func TestQuorumRequired(t *testing.T) {
 		nodes[id] = n
 		fsms[id] = f
 	}
+	wirePeerKeys(nodes)
 	// r2 and r3 never deliver anything (silent Byzantine/crashed backups).
 	c.setDrop(func(from, to string) bool { return from == "r2" || from == "r3" })
 
@@ -273,8 +288,12 @@ func TestByzantinePrimaryEquivocation(t *testing.T) {
 		t.Fatal("test digests collide")
 	}
 	// r0 (Byzantine primary) sends seq 1 = A to r1 and seq 1 = B to r2.
-	nodes["r1"].HandlePrePrepare(&PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqA), Req: reqA, Sender: "r0"})
-	nodes["r2"].HandlePrePrepare(&PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqB), Req: reqB, Sender: "r0"})
+	ppA := &PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqA), Req: reqA, Sender: "r0"}
+	ppA.Sig = nodes["r0"].sign(ppA)
+	nodes["r1"].HandlePrePrepare(ppA)
+	ppB := &PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqB), Req: reqB, Sender: "r0"}
+	ppB.Sig = nodes["r0"].sign(ppB)
+	nodes["r2"].HandlePrePrepare(ppB)
 	// Each backup multicasts its prepare; the other's prepare has a different
 	// digest and must not count. No replica can collect 2f matching prepares,
 	// so nothing may execute.
@@ -298,25 +317,39 @@ func TestIgnoreConflictingProposalAtSameSeq(t *testing.T) {
 	reqB := Request{Client: "c", Timestamp: 9, Command: []byte("B")}
 
 	// r1 accepts A for seq 1...
-	nodes["r1"].HandlePrePrepare(&PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqA), Req: reqA, Sender: "r0"})
+	ppA := &PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqA), Req: reqA, Sender: "r0"}
+	ppA.Sig = nodes["r0"].sign(ppA)
+	nodes["r1"].HandlePrePrepare(ppA)
 	// ...then the primary tries to overwrite seq 1 with B (equivocation).
-	nodes["r1"].HandlePrePrepare(&PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqB), Req: reqB, Sender: "r0"})
+	ppB := &PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqB), Req: reqB, Sender: "r0"}
+	ppB.Sig = nodes["r0"].sign(ppB)
+	nodes["r1"].HandlePrePrepare(ppB)
 	// Craft a full B certificate for r1: it must be ignored (r1 is on A).
 	for _, from := range []string{"r2", "r3"} {
-		nodes["r1"].HandlePrepare(&Prepare{View: 0, Seq: 1, Digest: digestOf(reqB), Sender: from})
+		p := &Prepare{View: 0, Seq: 1, Digest: digestOf(reqB), Sender: from}
+		p.Sig = nodes[from].sign(p)
+		nodes["r1"].HandlePrepare(p)
 	}
 	for _, from := range []string{"r2", "r3"} {
-		nodes["r1"].HandleCommit(&Commit{View: 0, Seq: 1, Digest: digestOf(reqB), Sender: from})
+		c := &Commit{View: 0, Seq: 1, Digest: digestOf(reqB), Sender: from}
+		c.Sig = nodes[from].sign(c)
+		nodes["r1"].HandleCommit(c)
 	}
 
 	// Control: r2 accepts B for seq 1 and the same crafted certificate drives
 	// it to execute B, proving the crafted messages are otherwise effective.
-	nodes["r2"].HandlePrePrepare(&PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqB), Req: reqB, Sender: "r0"})
+	ppB2 := &PrePrepare{View: 0, Seq: 1, Digest: digestOf(reqB), Req: reqB, Sender: "r0"}
+	ppB2.Sig = nodes["r0"].sign(ppB2)
+	nodes["r2"].HandlePrePrepare(ppB2)
 	for _, from := range []string{"r1", "r3"} {
-		nodes["r2"].HandlePrepare(&Prepare{View: 0, Seq: 1, Digest: digestOf(reqB), Sender: from})
+		p := &Prepare{View: 0, Seq: 1, Digest: digestOf(reqB), Sender: from}
+		p.Sig = nodes[from].sign(p)
+		nodes["r2"].HandlePrepare(p)
 	}
 	for _, from := range []string{"r1", "r3"} {
-		nodes["r2"].HandleCommit(&Commit{View: 0, Seq: 1, Digest: digestOf(reqB), Sender: from})
+		c := &Commit{View: 0, Seq: 1, Digest: digestOf(reqB), Sender: from}
+		c.Sig = nodes[from].sign(c)
+		nodes["r2"].HandleCommit(c)
 	}
 
 	waitFor(t, "r2 to execute the control request", time.Second, func() bool {
@@ -336,10 +369,21 @@ func TestPrepareRequiresMatchingPrePrepare(t *testing.T) {
 	nodes, fsms := startCluster(t, []string{"r0", "r1", "r2", "r3"})
 	req := Request{Client: "c", Timestamp: 3, Command: []byte("x")}
 	d := digestOf(req)
-	nodes["r1"].HandlePrepare(&Prepare{View: 0, Seq: 5, Digest: d, Sender: "r2"})
-	nodes["r1"].HandleCommit(&Commit{View: 0, Seq: 5, Digest: d, Sender: "r2"})
-	nodes["r1"].HandlePrePrepare(&PrePrepare{View: 1, Seq: 1, Digest: d, Req: req, Sender: "r0"}) // wrong view
-	nodes["r1"].HandlePrePrepare(&PrePrepare{View: 0, Seq: 1, Digest: "bogus", Req: req, Sender: "r0"})
+	pr := func(from string) *Prepare {
+		p := &Prepare{View: 0, Seq: 5, Digest: d, Sender: from}
+		p.Sig = nodes[from].sign(p)
+		return p
+	}
+	nodes["r1"].HandlePrepare(pr("r2"))
+	cm := &Commit{View: 0, Seq: 5, Digest: d, Sender: "r2"}
+	cm.Sig = nodes["r2"].sign(cm)
+	nodes["r1"].HandleCommit(cm)
+	wv := &PrePrepare{View: 1, Seq: 1, Digest: d, Req: req, Sender: "r0"}
+	wv.Sig = nodes["r0"].sign(wv)
+	nodes["r1"].HandlePrePrepare(wv) // wrong view
+	bd := &PrePrepare{View: 0, Seq: 1, Digest: "bogus", Req: req, Sender: "r0"}
+	bd.Sig = nodes["r0"].sign(bd)
+	nodes["r1"].HandlePrePrepare(bd)
 	time.Sleep(50 * time.Millisecond)
 	if got := fsms["r1"].snapshot(); len(got) != 0 {
 		t.Fatalf("r1 executed %v despite invalid messages", got)
