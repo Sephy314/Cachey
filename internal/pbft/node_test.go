@@ -80,6 +80,12 @@ func (t *memTransport) SendPrepare(_ context.Context, peer string, m *Prepare) e
 func (t *memTransport) SendCommit(_ context.Context, peer string, m *Commit) error {
 	return t.deliver(peer, func(r *Replica) { r.HandleCommit(m) })
 }
+func (t *memTransport) SendViewChange(_ context.Context, peer string, m *ViewChange) error {
+	return t.deliver(peer, func(r *Replica) { r.HandleViewChange(m) })
+}
+func (t *memTransport) SendNewView(_ context.Context, peer string, m *NewView) error {
+	return t.deliver(peer, func(r *Replica) { r.HandleNewView(m) })
+}
 
 func startCluster(t *testing.T, ids []string) (map[string]*Replica, map[string]*fsm) {
 	t.Helper()

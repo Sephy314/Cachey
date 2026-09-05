@@ -2,13 +2,14 @@
 // (Castro & Liskov, "Practical Byzantine Fault Tolerance", OSDI '99). A
 // cluster of N = 3f+1 replicas stays correct while up to f of them misbehave
 // arbitrarily (Byzantine faults: lying, equivocating, going silent). This
-// file is milestone M1: the normal-case protocol on a static primary (view
-// 0) — pre-prepare / prepare / commit — which totally orders client requests
-// and applies them to a state machine once a commit certificate is reached.
+// This file is the normal-case core: the pre-prepare / prepare / commit
+// protocol that totally orders client requests and applies them to a state
+// machine once a commit certificate (2f+1 matching commits) is reached.
 // There is no leader election: the primary for view v is the (v mod N)-th
-// replica, so M1's leader is fixed. Later milestones add view-change (M2),
-// message authentication with dynamic key exchange (M3), WAL durability (M4)
-// and store integration (M5).
+// replica (p = v mod |R|). View-change and new-view (recovering from a faulty
+// primary) live in viewchange.go. Later milestones add message authentication
+// with dynamic key exchange (M3), WAL durability (M4) and store integration
+// (M5).
 package pbft
 
 import (
@@ -28,7 +29,16 @@ var ErrNotPrimary = errors.New("pbft: not primary")
 type Config struct {
 	ID    string   // this replica's id (must be unique in the cluster)
 	Peers []string // peer replica ids, excluding self
+
+	// ViewChangeTimeout is how long a backup waits, after accepting a
+	// proposal it cannot execute, before suspecting the primary and starting
+	// a view change. 0 keeps the default (2s). Tests usually trigger view
+	// changes explicitly via StartViewChange to stay deterministic.
+	ViewChangeTimeout time.Duration
 }
+
+// defaultViewChangeTimeout applies when Config.ViewChangeTimeout is zero.
+const defaultViewChangeTimeout = 2 * time.Second
 
 // Transport delivers PBFT messages to peers. Implementations must be safe for
 // concurrent use: the in-memory test transport wires replicas directly, and
@@ -37,6 +47,8 @@ type Transport interface {
 	SendPrePrepare(ctx context.Context, peer string, m *PrePrepare) error
 	SendPrepare(ctx context.Context, peer string, m *Prepare) error
 	SendCommit(ctx context.Context, peer string, m *Commit) error
+	SendViewChange(ctx context.Context, peer string, m *ViewChange) error
+	SendNewView(ctx context.Context, peer string, m *NewView) error
 }
 
 // Replica is a single PBFT replica running the normal-case protocol.
@@ -54,9 +66,14 @@ type Replica struct {
 	applyFn func(seq uint64, req Request)
 
 	mu           sync.Mutex
-	view         uint64 // current view (0 in M1)
+	view         uint64 // current view
 	lastAssigned uint64 // highest sequence number the primary has handed out
 	nextExec     uint64 // first not-yet-executed sequence number
+	lastExecTime time.Time
+	vcTimeout    time.Duration // auto-suspect timeout
+	viewChanges  map[uint64]map[string]*ViewChange
+	vcSent       map[uint64]bool
+	nvSent       map[uint64]bool
 	log          map[uint64]*entry
 	// pendingPrepares / pendingCommits buffer prepares and commits that
 	// arrive before the matching pre-prepare (PBFT permits arbitrary message
@@ -69,6 +86,9 @@ type Replica struct {
 	// ponytail: seen, log and pending grow without bound until M4/M5 add a
 	// stable checkpoint watermark and gc. Fine for a milestone engine.
 	seen map[reqKey]string
+	// executedAt records the sequence at which each request was executed, so a
+	// later view-change can never re-order an executed request.
+	executedAt map[reqKey]uint64
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -81,15 +101,21 @@ type reqKey struct {
 	ts     uint64
 }
 
-// msgKey identifies prepare/commit messages by sequence number and digest.
+// msgKey identifies buffered prepare/commit messages by view, sequence number
+// and digest. The view matters: a prepare for the imminent view must not be
+// folded into an entry from an earlier view.
 type msgKey struct {
+	view   uint64
 	seq    uint64
 	digest string
 }
 
-// entry is the per-sequence-number protocol state at this replica.
+// entry is the per-sequence-number protocol state at this replica. view is the
+// view in which the current proposal was (re-)started; a new view supersedes
+// an unexecuted entry from an older view at the same sequence number.
 type entry struct {
 	seq         uint64
+	view        uint64
 	digest      string
 	req         Request
 	prePrepared bool // a valid pre-prepare was seen/issued for (view, seq)
@@ -141,7 +167,11 @@ func NewReplica(cfg Config, tr Transport, applyFn func(seq uint64, req Request))
 			peers = append(peers, id)
 		}
 	}
-	return &Replica{
+	vcTimeout := defaultViewChangeTimeout
+	if cfg.ViewChangeTimeout > 0 {
+		vcTimeout = cfg.ViewChangeTimeout
+	}
+	n := &Replica{
 		id:              cfg.ID,
 		all:             all,
 		members:         members,
@@ -149,22 +179,49 @@ func NewReplica(cfg Config, tr Transport, applyFn func(seq uint64, req Request))
 		f:               (len(all) - 1) / 3,
 		tr:              tr,
 		applyFn:         applyFn,
+		viewChanges:     make(map[uint64]map[string]*ViewChange),
+		vcSent:          make(map[uint64]bool),
+		nvSent:          make(map[uint64]bool),
+		vcTimeout:       vcTimeout,
+		lastExecTime:    time.Now(),
 		log:             make(map[uint64]*entry),
 		seen:            make(map[reqKey]string),
+		executedAt:      make(map[reqKey]uint64),
 		nextExec:        1, // first sequence number to execute (sequences start at 1)
 		pendingPrepares: make(map[msgKey]map[string]bool),
 		pendingCommits:  make(map[msgKey]map[string]bool),
 		stopCh:          make(chan struct{}),
 		doneCh:          make(chan struct{}),
-	}, nil
+	}
+	return n, nil
 }
 
-// Run starts background goroutines. In M1 the replica is purely reactive, so
-// this only waits for Stop (M2 adds a view-change timer loop here).
+// Run starts background goroutines: a view-change suspicion timer (a backup
+// that has accepted a proposal it cannot execute for ViewChangeTimeout starts
+// a view change) and the stop waiter.
 func (n *Replica) Run() {
 	go func() {
-		<-n.stopCh
-		close(n.doneCh)
+		defer close(n.doneCh)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				n.mu.Lock()
+				// A backup suspects the primary when it is stuck: it holds an
+				// accepted proposal it cannot execute and no progress has been
+				// made for a full timeout.
+				stuck := primaryID(n.all, n.view) != n.id &&
+					time.Since(n.lastExecTime) > n.vcTimeout &&
+					n.hasUnexecutedLocked()
+				if stuck && !n.vcSent[n.view+1] {
+					n.startViewChangeLocked()
+				}
+				n.mu.Unlock()
+			case <-n.stopCh:
+				return
+			}
+		}
 	}()
 }
 
@@ -246,7 +303,7 @@ func (n *Replica) Submit(command []byte) (uint64, error) {
 	seq := n.lastAssigned + 1
 	req := Request{Client: n.id + "/srv", Timestamp: seq, Command: command}
 	d := digestOf(req)
-	e := n.newEntry(seq, d, req)
+	e := n.newEntry(n.view, seq, d, req)
 	e.prePrepared = true
 	n.log[seq] = e
 	n.seen[reqKey{req.Client, req.Timestamp}] = d
@@ -305,34 +362,42 @@ func (n *Replica) HandlePrePrepare(m *PrePrepare) {
 		return // the same request id is already bound to a different digest
 	}
 	e := n.log[m.Seq]
+	if e != nil && e.view == n.view && e.digest != d {
+		return // equivocation: two different proposals for (view, seq)
+	}
 	if e == nil {
-		e = n.newEntry(m.Seq, d, m.Req)
+		e = n.newEntry(n.view, m.Seq, d, m.Req)
 		n.log[m.Seq] = e
 		n.seen[reqKey{m.Req.Client, m.Req.Timestamp}] = d
+	} else if e.view == n.view && e.prePrepared {
+		return // already processed in this view
 	} else if e.digest != d {
-		return // equivocation: two different proposals for (view, seq)
-	} else if e.prePrepared {
-		return // already processed
+		// An unexecuted proposal from an older view at this sequence is
+		// superseded by the current view's proposal.
+		e = n.newEntry(n.view, m.Seq, d, m.Req)
+		n.log[m.Seq] = e
+		n.seen[reqKey{m.Req.Client, m.Req.Timestamp}] = d
 	}
 	e.prePrepared = true
+	e.view = n.view
 	// Discard buffered prepares/commits for a different (equivocating) digest
 	// at this sequence: they can never match what we accepted.
-	n.dropConflictingPending(m.Seq, d)
+	n.dropConflictingPending(n.view, m.Seq, d)
 	pr := &Prepare{View: n.view, Seq: m.Seq, Digest: d, Sender: n.id}
 	n.broadcast(func(p string) { _ = n.tr.SendPrepare(context.Background(), p, pr) })
 	n.syncEntry(m.Seq)
 }
 
-// dropConflictingPending removes buffered prepares/commits for seq whose
-// digest differs from d. Must be called with n.mu held.
-func (n *Replica) dropConflictingPending(seq uint64, d string) {
+// dropConflictingPending removes buffered prepares/commits for seq in view
+// whose digest differs from d. Must be called with n.mu held.
+func (n *Replica) dropConflictingPending(view, seq uint64, d string) {
 	for k := range n.pendingPrepares {
-		if k.seq == seq && k.digest != d {
+		if k.view == view && k.seq == seq && k.digest != d {
 			delete(n.pendingPrepares, k)
 		}
 	}
 	for k := range n.pendingCommits {
-		if k.seq == seq && k.digest != d {
+		if k.view == view && k.seq == seq && k.digest != d {
 			delete(n.pendingCommits, k)
 		}
 	}
@@ -346,16 +411,24 @@ func (n *Replica) dropConflictingPending(seq uint64, d string) {
 func (n *Replica) HandlePrepare(m *Prepare) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if !n.isPeer(m.Sender) || m.View != n.view {
+	if !n.isPeer(m.Sender) {
 		return
 	}
-	if e := n.log[m.Seq]; e != nil && e.digest != m.Digest {
-		return // conflicts with the proposal we accepted for this sequence
+	// A prepare for the current view is counted; one for the imminent view is
+	// buffered so it survives the view change (it would otherwise be lost to a
+	// peer that has not entered the new view yet — the same out-of-order
+	// hazard as within a view). Anything further ahead is dropped.
+	if m.View != n.view && m.View != n.view+1 {
+		return
 	}
-	if n.pendingPrepares[msgKey{m.Seq, m.Digest}] == nil {
-		n.pendingPrepares[msgKey{m.Seq, m.Digest}] = make(map[string]bool)
+	e := n.log[m.Seq]
+	if e != nil && e.view == m.View && e.digest != m.Digest {
+		return // conflicts with the proposal accepted at this (view, seq)
 	}
-	n.pendingPrepares[msgKey{m.Seq, m.Digest}][m.Sender] = true
+	if n.pendingPrepares[msgKey{m.View, m.Seq, m.Digest}] == nil {
+		n.pendingPrepares[msgKey{m.View, m.Seq, m.Digest}] = make(map[string]bool)
+	}
+	n.pendingPrepares[msgKey{m.View, m.Seq, m.Digest}][m.Sender] = true
 	n.syncEntry(m.Seq)
 }
 
@@ -366,16 +439,20 @@ func (n *Replica) HandlePrepare(m *Prepare) {
 func (n *Replica) HandleCommit(m *Commit) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if !n.isPeer(m.Sender) || m.View != n.view {
+	if !n.isPeer(m.Sender) {
 		return
 	}
-	if e := n.log[m.Seq]; e != nil && e.digest != m.Digest {
-		return // conflicts with the proposal we accepted for this sequence
+	if m.View != n.view && m.View != n.view+1 {
+		return
 	}
-	if n.pendingCommits[msgKey{m.Seq, m.Digest}] == nil {
-		n.pendingCommits[msgKey{m.Seq, m.Digest}] = make(map[string]bool)
+	e := n.log[m.Seq]
+	if e != nil && e.view == m.View && e.digest != m.Digest {
+		return // conflicts with the proposal accepted at this (view, seq)
 	}
-	n.pendingCommits[msgKey{m.Seq, m.Digest}][m.Sender] = true
+	if n.pendingCommits[msgKey{m.View, m.Seq, m.Digest}] == nil {
+		n.pendingCommits[msgKey{m.View, m.Seq, m.Digest}] = make(map[string]bool)
+	}
+	n.pendingCommits[msgKey{m.View, m.Seq, m.Digest}][m.Sender] = true
 	n.syncEntry(m.Seq)
 }
 
@@ -388,10 +465,11 @@ func (n *Replica) syncEntry(seq uint64) {
 		return
 	}
 	// Fold matching prepares once we hold the pre-prepare.
-	for s := range n.pendingPrepares[msgKey{seq, e.digest}] {
+	k := msgKey{e.view, seq, e.digest}
+	for s := range n.pendingPrepares[k] {
 		e.prepares[s] = true
 	}
-	delete(n.pendingPrepares, msgKey{seq, e.digest})
+	delete(n.pendingPrepares, k)
 	if len(e.prepares) >= 2*n.f && !e.sentCommit {
 		e.sentCommit = true
 		c := &Commit{View: n.view, Seq: seq, Digest: e.digest, Sender: n.id}
@@ -401,19 +479,20 @@ func (n *Replica) syncEntry(seq uint64) {
 		return
 	}
 	// Fold matching commits (they only matter once we have sent our own).
-	for s := range n.pendingCommits[msgKey{seq, e.digest}] {
+	for s := range n.pendingCommits[k] {
 		e.commits[s] = true
 	}
-	delete(n.pendingCommits, msgKey{seq, e.digest})
+	delete(n.pendingCommits, k)
 	if e.commitCertified(n.f) {
 		n.executeReady()
 	}
 }
 
-// newEntry allocates an empty per-sequence entry.
-func (n *Replica) newEntry(seq uint64, d string, req Request) *entry {
+// newEntry allocates an empty per-sequence entry for view.
+func (n *Replica) newEntry(view, seq uint64, d string, req Request) *entry {
 	return &entry{
 		seq:      seq,
+		view:     view,
 		digest:   d,
 		req:      req,
 		prepares: make(map[string]bool),
@@ -438,6 +517,8 @@ func (n *Replica) executeReady() {
 		}
 		seq, req := n.nextExec, e.req
 		n.nextExec++
+		n.executedAt[reqKey{req.Client, req.Timestamp}] = seq
+		n.lastExecTime = time.Now()
 		if n.applyFn != nil {
 			n.applyFn(seq, req)
 		}
