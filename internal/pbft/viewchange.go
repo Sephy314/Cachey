@@ -48,14 +48,20 @@ func (n *Replica) startViewChangeLocked() {
 }
 
 // buildViewChangeLocked snapshots every known request above the executed
-// watermark into a VIEW-CHANGE for target. Must hold n.mu.
+// watermark into a VIEW-CHANGE for target, flagging each one the sender holds
+// a prepared certificate for. Must hold n.mu.
 func (n *Replica) buildViewChangeLocked(target uint64) *ViewChange {
 	vc := &ViewChange{View: target, S: n.nextExec - 1, Sender: n.id}
 	for seq, e := range n.log {
 		if seq <= n.nextExec-1 {
 			continue // executed; the new primary does not need them
 		}
-		vc.Entries = append(vc.Entries, ViewEntry{Seq: seq, Digest: e.digest, Req: e.req})
+		vc.Entries = append(vc.Entries, ViewEntry{
+			Seq:      seq,
+			Digest:   e.digest,
+			Req:      e.req,
+			Prepared: e.sentCommit, // 2f prepares received => a prepared certificate
+		})
 	}
 	sort.Slice(vc.Entries, func(i, j int) bool { return vc.Entries[i].Seq < vc.Entries[j].Seq })
 	return vc
@@ -132,15 +138,32 @@ func (n *Replica) maybeBuildNewViewLocked(target uint64) {
 // buildOEntriesLocked derives the NEW-VIEW pre-prepares: every request with a
 // sequence number in (floor, maxSeq], where floor is the highest executed
 // watermark among the collected view-changes and maxSeq the highest known
-// sequence. When several view-changes disagree on a sequence (an equivocating
-// old primary), the most-reported request wins, with the smallest digest as a
-// deterministic tie-break; nothing below floor is replayed because every
-// view-changing correct replica already executed it. Must hold n.mu.
+// sequence. Nothing below floor is replayed because every view-changing
+// correct replica already executed it.
+//
+// Per sequence, a request that at least one replica holds a PREPARED
+// certificate for always wins over a merely-known request, no matter how many
+// replicas merely report the latter; among requests with the same prepared
+// status the most-reported wins, with the smallest digest as a deterministic
+// tie-break. This preserves the view-change safety invariant: a request that
+// any correct replica prepared (hence any request that could have committed)
+// is never displaced in the new view by a request others only observed.
+//
+// ponytail: Prepared is asserted by each view-change sender but the underlying
+// certificate (the 2f signed PREPAREs) is not shipped, so a Byzantine replica
+// can still claim a request was prepared when it was not. Making the claim
+// Byzantine-safe requires carrying verifiable prepared certificates (the
+// signed pre-prepare + 2f prepares) in the VIEW-CHANGE and validating them
+// here — deferred alongside checkpoints/state transfer. Must hold n.mu.
 func (n *Replica) buildOEntriesLocked(target uint64) []PrePrepare {
 	set := n.viewChanges[target]
 	var floor, maxSeq uint64
-	seen := make(map[uint64]map[string]*Request) // seq -> digest -> request
-	reports := make(map[uint64]map[string]int)   // seq -> digest -> count
+	// seen[seq][digest] -> request and whether any reporter prepared it;
+	// reports[seq][digest] -> number of reporters that hold it (prepared or
+	// merely known, counted separately below).
+	seen := make(map[uint64]map[string]*Request)
+	preparedFor := make(map[uint64]map[string]bool) // seq -> digest -> any prepared
+	reports := make(map[uint64]map[string]int)
 	for _, vc := range set {
 		if vc.S > floor {
 			floor = vc.S
@@ -158,12 +181,14 @@ func (n *Replica) buildOEntriesLocked(target uint64) []PrePrepare {
 			}
 			if seen[en.Seq] == nil {
 				seen[en.Seq] = make(map[string]*Request)
+				preparedFor[en.Seq] = make(map[string]bool)
 				reports[en.Seq] = make(map[string]int)
 			}
 			if _, ok := seen[en.Seq][en.Digest]; !ok {
 				req := en.Req
 				seen[en.Seq][en.Digest] = &req
 			}
+			preparedFor[en.Seq][en.Digest] = preparedFor[en.Seq][en.Digest] || en.Prepared
 			reports[en.Seq][en.Digest]++
 		}
 	}
@@ -172,12 +197,18 @@ func (n *Replica) buildOEntriesLocked(target uint64) []PrePrepare {
 		if len(seen[seq]) == 0 {
 			continue
 		}
-		// pick the most-reported request for this sequence (smallest digest
-		// breaks ties deterministically)
-		bestD, bestN := "", -1
-		for d, count := range reports[seq] {
-			if count > bestN || (count == bestN && (bestD == "" || d < bestD)) {
-				bestD, bestN = d, count
+		// A prepared request outranks every merely-known one; within the same
+		// rank, the most-reported request wins (smallest digest tie-break).
+		bestD := ""
+		bestRank, bestN := -1, -1
+		for d := range seen[seq] {
+			rank := 0
+			if preparedFor[seq][d] {
+				rank = 1
+			}
+			n := reports[seq][d]
+			if rank > bestRank || (rank == bestRank && (n > bestN || (n == bestN && (bestD == "" || d < bestD)))) {
+				bestD, bestRank, bestN = d, rank, n
 			}
 		}
 		o = append(o, PrePrepare{

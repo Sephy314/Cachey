@@ -54,13 +54,17 @@ type Commit struct {
 }
 
 // ViewEntry is one request a view-change sender still knows about (above its
-// executed watermark). The new primary rebuilds the new view's pre-prepares
-// from these (PBFT §4.4's prepared-certificate set, simplified to the full
-// log tail above the sender's last executed sequence).
+// executed watermark). Prepared reports whether the sender actually held a
+// prepared certificate for it (the pre-prepare plus 2f matching prepares) in
+// the view being left, as opposed to merely having accepted its pre-prepare.
+// The new primary replays genuinely prepared requests ahead of merely-known
+// ones, so a request that some correct replica prepared can never be displaced
+// by a request that other replicas merely observed.
 type ViewEntry struct {
-	Seq    uint64  `json:"seq"`
-	Digest string  `json:"digest"`
-	Req    Request `json:"req"`
+	Seq      uint64  `json:"seq"`
+	Digest   string  `json:"digest"`
+	Req      Request `json:"req"`
+	Prepared bool    `json:"prepared"`
 }
 
 // ViewChange announces a replica's suspicion of the current primary and

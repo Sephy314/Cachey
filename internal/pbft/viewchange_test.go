@@ -192,3 +192,88 @@ func TestByzantineReplicaStillEquivocatesAuthentically(t *testing.T) {
 		}
 	}
 }
+
+// TestPreparedRequestNotDisplacedByMereReport pins the view-change safety
+// invariant that motivated the prepared-certificate field in VIEW-CHANGE.
+// N=4, f=1: the Byzantine primary r0 equivocates — it proposes A at seq 1 to
+// r1 and r2 (and backstops them with its own PREPARE so both reach a genuine
+// prepared certificate for A), and proposes a different request B at seq 1 to
+// r3, which merely knows B. A Byzantine VIEW-CHANGE from r0 then reports B
+// too, so B is "known by multiple replicas" while only A was ever prepared.
+// After the view change the NEW-VIEW must re-propose the prepared A at seq 1;
+// the merely-known B must not displace it, no matter how many replicas report B.
+func TestPreparedRequestNotDisplacedByMereReport(t *testing.T) {
+	nodes, fsms := startCluster(t, []string{"r0", "r1", "r2", "r3"})
+	reqA := Request{Client: "c", Timestamp: 21, Command: []byte("A")}
+	reqB := Request{Client: "c", Timestamp: 21, Command: []byte("B")}
+	dA, dB := digestOf(reqA), digestOf(reqB)
+	if dA == dB {
+		t.Fatal("test digests collide")
+	}
+
+	// Byzantine primary r0 proposes A@1 to r1 and r2, B@1 to r3.
+	for _, to := range []string{"r1", "r2"} {
+		pp := &PrePrepare{View: 0, Seq: 1, Digest: dA, Req: reqA, Sender: "r0"}
+		pp.Sig = nodes["r0"].sign(pp)
+		nodes[to].HandlePrePrepare(pp)
+	}
+	ppB := &PrePrepare{View: 0, Seq: 1, Digest: dB, Req: reqB, Sender: "r0"}
+	ppB.Sig = nodes["r0"].sign(ppB)
+	nodes["r3"].HandlePrePrepare(ppB)
+
+	// r0 backstops A with its own PREPARE so r1 and r2 each collect 2f=2
+	// matching prepares (the other backup + r0) and hold a prepared
+	// certificate for A — but they get only one commit each, so A is never
+	// committed and stays in the view-change range.
+	for _, to := range []string{"r1", "r2"} {
+		p := &Prepare{View: 0, Seq: 1, Digest: dA, Sender: "r0"}
+		p.Sig = nodes["r0"].sign(p)
+		nodes[to].HandlePrepare(p)
+	}
+	// r1 must be prepared for A but have executed nothing; r3 must merely know
+	// B (not prepared for it).
+	waitFor(t, "r1 to hold a prepared certificate for A", time.Second, func() bool {
+		nodes["r1"].mu.Lock()
+		defer nodes["r1"].mu.Unlock()
+		e := nodes["r1"].log[1]
+		return e != nil && e.sentCommit
+	})
+	time.Sleep(50 * time.Millisecond)
+	nodes["r1"].mu.Lock()
+	e1 := nodes["r1"].log[1]
+	preparedA, execA := e1 != nil && e1.sentCommit, nodes["r1"].nextExec-1
+	nodes["r1"].mu.Unlock()
+	if !preparedA || execA != 0 {
+		t.Fatalf("r1 preparedA=%v exec=%d, want prepared and nothing executed", preparedA, execA)
+	}
+	nodes["r3"].mu.Lock()
+	e3 := nodes["r3"].log[1]
+	preparedB := e3 != nil && e3.sentCommit
+	nodes["r3"].mu.Unlock()
+	if preparedB {
+		t.Fatal("r3 should merely know B, not hold a prepared certificate for it")
+	}
+	if got := fsms["r1"].snapshot(); len(got) != 0 {
+		t.Fatalf("r1 executed %v before the view change", got)
+	}
+
+	// Backups suspect. r1 is the view-1 primary; it must build O with the
+	// prepared A even though B is reported by r3 and by r0's Byzantine
+	// VIEW-CHANGE below (so B and A tie at two reports each).
+	nodes["r1"].StartViewChange()
+	nodes["r2"].StartViewChange()
+	byzVC := &ViewChange{
+		View: 1, S: 0, Sender: "r0",
+		Entries: []ViewEntry{{Seq: 1, Digest: dB, Req: reqB, Prepared: false}},
+	}
+	byzVC.Sig = nodes["r0"].sign(byzVC)
+	nodes["r1"].HandleViewChange(byzVC) // r1 now holds r1+r2+r0 => builds NEW-VIEW
+	nodes["r3"].StartViewChange()
+
+	want := []string{"1:A"}
+	for _, id := range []string{"r0", "r1", "r2", "r3"} {
+		waitFor(t, id+" to execute the prepared A (not the merely-known B)", 3*time.Second, func() bool {
+			return equal(fsms[id].snapshot(), want)
+		})
+	}
+}
