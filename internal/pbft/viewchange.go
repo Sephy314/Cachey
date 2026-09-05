@@ -2,6 +2,7 @@ package pbft
 
 import (
 	"context"
+	"log"
 	"sort"
 )
 
@@ -435,6 +436,11 @@ func (n *Replica) adoptNewViewPrePrepareLocked(pp PrePrepare) {
 	n.log[seq] = e
 	n.seen[reqKey{pp.Req.Client, pp.Req.Timestamp}] = d
 	n.dropConflictingPending(n.view, seq, d)
+	// Durably record the adopted order (best-effort: O is already known to the
+	// cluster, so a failed write weakens crash durability, not liveness).
+	if err := n.persistRequestLocked(n.view, seq, pp.Req); err != nil {
+		log.Printf("pbft[%s]: persist adopted request at seq %d: %v", n.id, seq, err)
+	}
 	// Backups multicast a matching PREPARE for the new view's proposal. The new
 	// primary does not: it proposed via the O pre-prepare, so its vote is
 	// already counted (PBFT counts 2f prepares from distinct backups).
