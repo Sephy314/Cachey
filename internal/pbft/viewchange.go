@@ -48,23 +48,38 @@ func (n *Replica) startViewChangeLocked() {
 }
 
 // buildViewChangeLocked snapshots every known request above the executed
-// watermark into a VIEW-CHANGE for target, flagging each one the sender holds
-// a prepared certificate for. Must hold n.mu.
+// watermark into a VIEW-CHANGE for target. Entries this replica holds a
+// prepared certificate for carry it as verifiable evidence; the rest are
+// merely-known (their pre-prepare was accepted but never prepared). Must hold
+// n.mu.
 func (n *Replica) buildViewChangeLocked(target uint64) *ViewChange {
 	vc := &ViewChange{View: target, S: n.nextExec - 1, Sender: n.id}
 	for seq, e := range n.log {
 		if seq <= n.nextExec-1 {
 			continue // executed; the new primary does not need them
 		}
-		vc.Entries = append(vc.Entries, ViewEntry{
-			Seq:      seq,
-			Digest:   e.digest,
-			Req:      e.req,
-			Prepared: e.sentCommit, // 2f prepares received => a prepared certificate
-		})
+		en := ViewEntry{Seq: seq, Digest: e.digest, Req: e.req}
+		if e.sentCommit { // reached prepared (2f prepares) in this view
+			en.Cert = n.preparedCertLocked(e)
+		}
+		vc.Entries = append(vc.Entries, en)
 	}
 	sort.Slice(vc.Entries, func(i, j int) bool { return vc.Entries[i].Seq < vc.Entries[j].Seq })
 	return vc
+}
+
+// preparedCertLocked assembles the verifiable prepared certificate for a
+// prepared entry: the signed pre-prepare that ordered it plus every retained
+// signed matching prepare. Must hold n.mu.
+func (n *Replica) preparedCertLocked(e *entry) *PreparedCert {
+	cert := &PreparedCert{PrePrepare: e.pp}
+	for _, pm := range e.prepares {
+		cert.Prepares = append(cert.Prepares, pm)
+	}
+	sort.Slice(cert.Prepares, func(i, j int) bool {
+		return cert.Prepares[i].Sender < cert.Prepares[j].Sender
+	})
+	return cert
 }
 
 // addViewChangeLocked records a VIEW-CHANGE for a target view. Must hold n.mu.
@@ -93,21 +108,63 @@ func (n *Replica) HandleViewChange(m *ViewChange) {
 	if m.View <= n.view || m.View != n.view+1 {
 		return // stale, or a replica jumping more than one view ahead
 	}
-	if !validViewChange(m) {
+	if !n.validViewChange(m) {
 		return
 	}
 	n.addViewChangeLocked(m)
 	n.maybeBuildNewViewLocked(m.View)
 }
 
-// validViewChange reports whether every carried entry matches its digest.
-func validViewChange(vc *ViewChange) bool {
+// validViewChange reports whether every carried entry matches its digest and
+// every claimed prepared certificate is genuinely valid. A Byzantine replica
+// can assert anything in its own VIEW-CHANGE, so prepared-ness must be proven:
+// a non-nil Cert is only trusted after validCert verifies its signatures and
+// quorum. Must hold n.mu.
+func (n *Replica) validViewChange(vc *ViewChange) bool {
 	for _, en := range vc.Entries {
 		if en.Seq == 0 || digestOf(en.Req) != en.Digest {
 			return false
 		}
+		if en.Cert != nil && !n.validCert(vc, en) {
+			return false
+		}
 	}
 	return true
+}
+
+// validCert verifies a claimed prepared certificate: the pre-prepare must be
+// authentic, issued by the primary of its view, for this exact sequence and
+// request in the view being left, and at least 2f distinct replicas must have
+// sent authentic matching prepares. Without those, a Byzantine replica cannot
+// prove a request was prepared, so its claim is rejected. Must hold n.mu.
+func (n *Replica) validCert(vc *ViewChange, en ViewEntry) bool {
+	pp := en.Cert.PrePrepare
+	if pp == nil || pp.Seq != en.Seq || pp.Digest != en.Digest || pp.View+1 != vc.View {
+		return false
+	}
+	// The pre-prepare must come from the primary of its own view and be
+	// authentic (a non-primary cannot order requests).
+	if !n.members[pp.Sender] || pp.Sender != primaryID(n.all, pp.View) {
+		return false
+	}
+	if !verifyPayload(n.peerKeys[pp.Sender], pp.Sig, pp) {
+		return false
+	}
+	// At least 2f distinct authentic prepares must match the pre-prepare.
+	seen := make(map[string]bool, len(en.Cert.Prepares))
+	for _, p := range en.Cert.Prepares {
+		if p == nil || p.View != pp.View || p.Seq != pp.Seq || p.Digest != pp.Digest {
+			return false
+		}
+		if !n.members[p.Sender] || seen[p.Sender] {
+			return false
+		}
+		if !verifyPayload(n.peerKeys[p.Sender], p.Sig, p) {
+			return false
+		}
+		seen[p.Sender] = true
+	}
+	return len(seen) >= 2*n.f
 }
 
 // maybeBuildNewViewLocked makes the next view's primary emit a NEW-VIEW once
@@ -141,28 +198,22 @@ func (n *Replica) maybeBuildNewViewLocked(target uint64) {
 // sequence. Nothing below floor is replayed because every view-changing
 // correct replica already executed it.
 //
-// Per sequence, a request that at least one replica holds a PREPARED
-// certificate for always wins over a merely-known request, no matter how many
-// replicas merely report the latter; among requests with the same prepared
-// status the most-reported wins, with the smallest digest as a deterministic
-// tie-break. This preserves the view-change safety invariant: a request that
-// any correct replica prepared (hence any request that could have committed)
-// is never displaced in the new view by a request others only observed.
-//
-// ponytail: Prepared is asserted by each view-change sender but the underlying
-// certificate (the 2f signed PREPAREs) is not shipped, so a Byzantine replica
-// can still claim a request was prepared when it was not. Making the claim
-// Byzantine-safe requires carrying verifiable prepared certificates (the
-// signed pre-prepare + 2f prepares) in the VIEW-CHANGE and validating them
-// here — deferred alongside checkpoints/state transfer. Must hold n.mu.
+// Per sequence, a request backed by a verifiable prepared certificate always
+// wins over a merely-known request, no matter how many replicas merely report
+// the latter (or claim a certificate they cannot prove); among requests with
+// the same status the most-reported wins, with the smallest digest as a
+// deterministic tie-break. Every collected VIEW-CHANGE was validated on receipt
+// (validViewChange), so a non-nil Cert here is a genuine prepared certificate.
+// This preserves the view-change safety invariant: a request any correct
+// replica prepared — hence any request that could have committed — is never
+// displaced in the new view. Must hold n.mu.
 func (n *Replica) buildOEntriesLocked(target uint64) []PrePrepare {
 	set := n.viewChanges[target]
 	var floor, maxSeq uint64
-	// seen[seq][digest] -> request and whether any reporter prepared it;
-	// reports[seq][digest] -> number of reporters that hold it (prepared or
-	// merely known, counted separately below).
+	// seen[seq][digest] -> request; preparedFor[seq][digest] -> backed by a
+	// valid certificate; reports[seq][digest] -> number of reporters.
 	seen := make(map[uint64]map[string]*Request)
-	preparedFor := make(map[uint64]map[string]bool) // seq -> digest -> any prepared
+	preparedFor := make(map[uint64]map[string]bool)
 	reports := make(map[uint64]map[string]int)
 	for _, vc := range set {
 		if vc.S > floor {
@@ -188,7 +239,7 @@ func (n *Replica) buildOEntriesLocked(target uint64) []PrePrepare {
 				req := en.Req
 				seen[en.Seq][en.Digest] = &req
 			}
-			preparedFor[en.Seq][en.Digest] = preparedFor[en.Seq][en.Digest] || en.Prepared
+			preparedFor[en.Seq][en.Digest] = preparedFor[en.Seq][en.Digest] || en.Cert != nil
 			reports[en.Seq][en.Digest]++
 		}
 	}
@@ -197,7 +248,7 @@ func (n *Replica) buildOEntriesLocked(target uint64) []PrePrepare {
 		if len(seen[seq]) == 0 {
 			continue
 		}
-		// A prepared request outranks every merely-known one; within the same
+		// A certified request outranks every merely-known one; within the same
 		// rank, the most-reported request wins (smallest digest tie-break).
 		bestD := ""
 		bestRank, bestN := -1, -1
@@ -218,6 +269,11 @@ func (n *Replica) buildOEntriesLocked(target uint64) []PrePrepare {
 			Req:    *seen[seq][bestD],
 			Sender: n.id,
 		})
+	}
+	// Each O pre-prepare is signed by the new primary so it can later serve as
+	// verifiable certificate evidence in the next view change.
+	for i := range o {
+		o[i].Sig = n.sign(&o[i])
 	}
 	return o
 }
@@ -245,7 +301,7 @@ func (n *Replica) HandleNewView(nv *NewView) {
 		if vc == nil || vc.View != nv.View || !n.members[vc.Sender] || senders[vc.Sender] {
 			return
 		}
-		if !validViewChange(vc) {
+		if !n.validViewChange(vc) {
 			return
 		}
 		if !n.verify(vc.Sender, vc.Sig, vc) {
@@ -263,6 +319,31 @@ func (n *Replica) HandleNewView(nv *NewView) {
 		if !viewChangeCovers(nv.V, pp) {
 			return // every replayed request must come from a view-change
 		}
+	}
+	// A NEW-VIEW must not displace a prepared request: every sequence in the
+	// replay range that some collected view-change certifies must appear in O
+	// with exactly that request, and O must not propose a conflicting one.
+	// This guards against a Byzantine new primary that ignores certificates.
+	need := make(map[uint64]string) // seq -> required digest
+	for _, vc := range nv.V {
+		for _, en := range vc.Entries {
+			if en.Cert == nil {
+				continue
+			}
+			if d, ok := need[en.Seq]; ok && d != en.Digest {
+				return // two conflicting prepared certificates: invalid NEW-VIEW
+			}
+			need[en.Seq] = en.Digest
+		}
+	}
+	for _, pp := range nv.O {
+		if d, ok := need[pp.Seq]; ok && d != pp.Digest {
+			return // O displaces a certified request
+		}
+		delete(need, pp.Seq)
+	}
+	if len(need) != 0 {
+		return // a certified request was omitted from O
 	}
 	for _, vc := range nv.V {
 		n.addViewChangeLocked(vc)
@@ -343,6 +424,7 @@ func (n *Replica) adoptNewViewPrePrepareLocked(pp PrePrepare) {
 	}
 	e := n.newEntry(n.view, seq, d, pp.Req)
 	e.prePrepared = true
+	e.pp = &pp // the O pre-prepare (signed by the new primary) is certificate evidence
 	n.log[seq] = e
 	n.seen[reqKey{pp.Req.Client, pp.Req.Timestamp}] = d
 	n.dropConflictingPending(n.view, seq, d)

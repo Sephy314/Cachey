@@ -53,18 +53,28 @@ type Commit struct {
 	Sig    []byte `json:"sig,omitempty"`
 }
 
+// PreparedCert is a verifiable prepared certificate for one request: the
+// signed PRE-PREPARE that ordered it plus the signed PREPAREs the sender
+// collected. A new primary validates the signatures and the 2f quorum before
+// treating a request as genuinely prepared, so a Byzantine replica cannot
+// conjure a prepared certificate for a request nobody actually prepared.
+type PreparedCert struct {
+	PrePrepare *PrePrepare `json:"pre_prepare"`
+	Prepares   []*Prepare  `json:"prepares"`
+}
+
 // ViewEntry is one request a view-change sender still knows about (above its
-// executed watermark). Prepared reports whether the sender actually held a
-// prepared certificate for it (the pre-prepare plus 2f matching prepares) in
-// the view being left, as opposed to merely having accepted its pre-prepare.
-// The new primary replays genuinely prepared requests ahead of merely-known
-// ones, so a request that some correct replica prepared can never be displaced
-// by a request that other replicas merely observed.
+// executed watermark). Cert is non-nil only when the sender holds a verifiable
+// prepared certificate for the request in the view being left; entries without
+// a certificate were merely accepted (their pre-prepare seen) but never
+// prepared. The new primary replays certified requests ahead of merely-known
+// ones, so a request some correct replica prepared can never be displaced by a
+// request others merely observed or that a Byzantine claims.
 type ViewEntry struct {
-	Seq      uint64  `json:"seq"`
-	Digest   string  `json:"digest"`
-	Req      Request `json:"req"`
-	Prepared bool    `json:"prepared"`
+	Seq    uint64        `json:"seq"`
+	Digest string        `json:"digest"`
+	Req    Request       `json:"req"`
+	Cert   *PreparedCert `json:"cert,omitempty"`
 }
 
 // ViewChange announces a replica's suspicion of the current primary and

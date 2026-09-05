@@ -193,24 +193,21 @@ func TestByzantineReplicaStillEquivocatesAuthentically(t *testing.T) {
 	}
 }
 
-// TestPreparedRequestNotDisplacedByMereReport pins the view-change safety
-// invariant that motivated the prepared-certificate field in VIEW-CHANGE.
-// N=4, f=1: the Byzantine primary r0 equivocates — it proposes A at seq 1 to
-// r1 and r2 (and backstops them with its own PREPARE so both reach a genuine
-// prepared certificate for A), and proposes a different request B at seq 1 to
-// r3, which merely knows B. A Byzantine VIEW-CHANGE from r0 then reports B
-// too, so B is "known by multiple replicas" while only A was ever prepared.
-// After the view change the NEW-VIEW must re-propose the prepared A at seq 1;
-// the merely-known B must not displace it, no matter how many replicas report B.
-func TestPreparedRequestNotDisplacedByMereReport(t *testing.T) {
-	nodes, fsms := startCluster(t, []string{"r0", "r1", "r2", "r3"})
+// preparedA_vs_mereB sets up the shared N=4 f=1 scenario behind the view-change
+// certificate tests: the Byzantine primary r0 equivocates at seq 1 — it
+// proposes A to r1 and r2 and backstops them with its own PREPARE so both hold
+// a GENUINE prepared certificate for A (but get only one commit each, so A
+// never commits and stays in the view-change range), and proposes a different
+// request B to r3, which merely knows B (accepted the pre-prepare, never
+// prepared). Verifies the preconditions and returns the two requests.
+func preparedA_vs_mereB(t *testing.T, nodes map[string]*Replica, fsms map[string]*fsm) (Request, Request) {
+	t.Helper()
 	reqA := Request{Client: "c", Timestamp: 21, Command: []byte("A")}
 	reqB := Request{Client: "c", Timestamp: 21, Command: []byte("B")}
 	dA, dB := digestOf(reqA), digestOf(reqB)
 	if dA == dB {
 		t.Fatal("test digests collide")
 	}
-
 	// Byzantine primary r0 proposes A@1 to r1 and r2, B@1 to r3.
 	for _, to := range []string{"r1", "r2"} {
 		pp := &PrePrepare{View: 0, Seq: 1, Digest: dA, Req: reqA, Sender: "r0"}
@@ -220,11 +217,9 @@ func TestPreparedRequestNotDisplacedByMereReport(t *testing.T) {
 	ppB := &PrePrepare{View: 0, Seq: 1, Digest: dB, Req: reqB, Sender: "r0"}
 	ppB.Sig = nodes["r0"].sign(ppB)
 	nodes["r3"].HandlePrePrepare(ppB)
-
 	// r0 backstops A with its own PREPARE so r1 and r2 each collect 2f=2
-	// matching prepares (the other backup + r0) and hold a prepared
-	// certificate for A — but they get only one commit each, so A is never
-	// committed and stays in the view-change range.
+	// matching prepares (the other backup + r0) and hold a prepared certificate
+	// for A — but only one commit each, so A is never committed.
 	for _, to := range []string{"r1", "r2"} {
 		p := &Prepare{View: 0, Seq: 1, Digest: dA, Sender: "r0"}
 		p.Sig = nodes["r0"].sign(p)
@@ -256,15 +251,28 @@ func TestPreparedRequestNotDisplacedByMereReport(t *testing.T) {
 	if got := fsms["r1"].snapshot(); len(got) != 0 {
 		t.Fatalf("r1 executed %v before the view change", got)
 	}
+	return reqA, reqB
+}
+
+// TestPreparedRequestNotDisplacedByMereReport pins the view-change safety
+// invariant behind the certificate preference in buildOEntriesLocked. A
+// Byzantine VIEW-CHANGE from r0 reports B too, so the merely-known B ties A at
+// two reports — but only A is certified. After the view change the NEW-VIEW
+// must re-propose the certified A at seq 1; the merely-known B must not
+// displace it, no matter how many replicas report B.
+func TestPreparedRequestNotDisplacedByMereReport(t *testing.T) {
+	nodes, fsms := startCluster(t, []string{"r0", "r1", "r2", "r3"})
+	_, reqB := preparedA_vs_mereB(t, nodes, fsms)
+	dB := digestOf(reqB)
 
 	// Backups suspect. r1 is the view-1 primary; it must build O with the
-	// prepared A even though B is reported by r3 and by r0's Byzantine
-	// VIEW-CHANGE below (so B and A tie at two reports each).
+	// certified A even though B is reported by r3 and by r0's Byzantine
+	// VIEW-CHANGE below (B and A tie at two reports each).
 	nodes["r1"].StartViewChange()
 	nodes["r2"].StartViewChange()
 	byzVC := &ViewChange{
 		View: 1, S: 0, Sender: "r0",
-		Entries: []ViewEntry{{Seq: 1, Digest: dB, Req: reqB, Prepared: false}},
+		Entries: []ViewEntry{{Seq: 1, Digest: dB, Req: reqB}}, // merely-known: no cert
 	}
 	byzVC.Sig = nodes["r0"].sign(byzVC)
 	nodes["r1"].HandleViewChange(byzVC) // r1 now holds r1+r2+r0 => builds NEW-VIEW
@@ -272,7 +280,55 @@ func TestPreparedRequestNotDisplacedByMereReport(t *testing.T) {
 
 	want := []string{"1:A"}
 	for _, id := range []string{"r0", "r1", "r2", "r3"} {
-		waitFor(t, id+" to execute the prepared A (not the merely-known B)", 3*time.Second, func() bool {
+		waitFor(t, id+" to execute the certified A (not the merely-known B)", 3*time.Second, func() bool {
+			return equal(fsms[id].snapshot(), want)
+		})
+	}
+}
+
+// TestBogusPreparedClaimRejected pins the verifiable-certificate rule: a
+// Byzantine replica that asserts Prepared (a certificate) for a conflicting
+// request it cannot actually prove is not trusted. Here r0 claims B@1 was
+// prepared, but the attached certificate has only one authentic matching
+// prepare (fewer than 2f), so r1 must reject the VIEW-CHANGE outright and the
+// subsequent view change must still re-propose the genuinely certified A.
+func TestBogusPreparedClaimRejected(t *testing.T) {
+	nodes, fsms := startCluster(t, []string{"r0", "r1", "r2", "r3"})
+	_, reqB := preparedA_vs_mereB(t, nodes, fsms)
+	dB := digestOf(reqB)
+
+	// r0's "certificate" for B: a valid pre-prepare (r0 is the view-0 primary)
+	// plus only one authentic prepare (from r3) — short of the 2f=2 needed.
+	ppB := &PrePrepare{View: 0, Seq: 1, Digest: dB, Req: reqB, Sender: "r0"}
+	ppB.Sig = nodes["r0"].sign(ppB)
+	prepR3 := &Prepare{View: 0, Seq: 1, Digest: dB, Sender: "r3"}
+	prepR3.Sig = nodes["r3"].sign(prepR3)
+	bogus := &ViewChange{
+		View: 1, S: 0, Sender: "r0",
+		Entries: []ViewEntry{{
+			Seq: 1, Digest: dB, Req: reqB,
+			Cert: &PreparedCert{PrePrepare: ppB, Prepares: []*Prepare{prepR3}},
+		}},
+	}
+	bogus.Sig = nodes["r0"].sign(bogus)
+	nodes["r1"].HandleViewChange(bogus)
+
+	// r1 (the view-1 primary) must reject the unverifiable certificate: r0 is
+	// not counted toward the view change, so it cannot make B look prepared.
+	nodes["r1"].mu.Lock()
+	_, counted := nodes["r1"].viewChanges[1][bogus.Sender]
+	nodes["r1"].mu.Unlock()
+	if counted {
+		t.Fatal("r1 accepted a VIEW-CHANGE whose prepared certificate cannot be verified")
+	}
+
+	// The genuine view change by the correct backups converges on the certified A.
+	nodes["r1"].StartViewChange()
+	nodes["r2"].StartViewChange()
+	nodes["r3"].StartViewChange()
+	want := []string{"1:A"}
+	for _, id := range []string{"r0", "r1", "r2", "r3"} {
+		waitFor(t, id+" to execute the certified A (the bogus B claim was rejected)", 3*time.Second, func() bool {
 			return equal(fsms[id].snapshot(), want)
 		})
 	}

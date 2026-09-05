@@ -85,7 +85,9 @@ type Replica struct {
 	// pendingPrepares / pendingCommits buffer prepares and commits that
 	// arrive before the matching pre-prepare (PBFT permits arbitrary message
 	// reordering); they are folded into the entry once it is pre-prepared.
-	pendingPrepares map[msgKey]map[string]bool
+	// Prepare messages are retained so a ViewChange can later ship a verifiable
+	// prepared certificate.
+	pendingPrepares map[msgKey]map[string]*Prepare
 	pendingCommits  map[msgKey]map[string]bool
 	// seen records (client, timestamp) -> request digest, so a replica
 	// detects a request replayed under a conflicting sequence number.
@@ -119,14 +121,18 @@ type msgKey struct {
 
 // entry is the per-sequence-number protocol state at this replica. view is the
 // view in which the current proposal was (re-)started; a new view supersedes
-// an unexecuted entry from an older view at the same sequence number.
+// an unexecuted entry from an older view at the same sequence number. pp is
+// the signed pre-prepare that ordered the entry and prepares retains the
+// signed matching prepares from other replicas, so a prepared entry can later
+// ship a verifiable prepared certificate in a ViewChange.
 type entry struct {
 	seq         uint64
 	view        uint64
 	digest      string
 	req         Request
+	pp          *PrePrepare
 	prePrepared bool // a valid pre-prepare was seen/issued for (view, seq)
-	prepares    map[string]bool
+	prepares    map[string]*Prepare
 	sentCommit  bool
 	commits     map[string]bool
 }
@@ -196,7 +202,7 @@ func NewReplica(cfg Config, tr Transport, applyFn func(seq uint64, req Request))
 		seen:            make(map[reqKey]string),
 		executedAt:      make(map[reqKey]uint64),
 		nextExec:        1, // first sequence number to execute (sequences start at 1)
-		pendingPrepares: make(map[msgKey]map[string]bool),
+		pendingPrepares: make(map[msgKey]map[string]*Prepare),
 		pendingCommits:  make(map[msgKey]map[string]bool),
 		stopCh:          make(chan struct{}),
 		doneCh:          make(chan struct{}),
@@ -361,6 +367,7 @@ func (n *Replica) Submit(command []byte) (uint64, error) {
 	}
 	pp := &PrePrepare{View: n.view, Seq: seq, Digest: d, Req: req, Sender: n.id}
 	pp.Sig = n.sign(pp)
+	e.pp = pp
 	n.broadcast(func(p string) { _ = n.tr.SendPrePrepare(context.Background(), p, pp) })
 	return seq, nil
 }
@@ -429,6 +436,7 @@ func (n *Replica) HandlePrePrepare(m *PrePrepare) {
 	}
 	e.prePrepared = true
 	e.view = n.view
+	e.pp = m // retain the signed pre-prepare as certificate evidence
 	// Discard buffered prepares/commits for a different (equivocating) digest
 	// at this sequence: they can never match what we accepted.
 	n.dropConflictingPending(n.view, m.Seq, d)
@@ -479,9 +487,9 @@ func (n *Replica) HandlePrepare(m *Prepare) {
 		return // conflicts with the proposal accepted at this (view, seq)
 	}
 	if n.pendingPrepares[msgKey{m.View, m.Seq, m.Digest}] == nil {
-		n.pendingPrepares[msgKey{m.View, m.Seq, m.Digest}] = make(map[string]bool)
+		n.pendingPrepares[msgKey{m.View, m.Seq, m.Digest}] = make(map[string]*Prepare)
 	}
-	n.pendingPrepares[msgKey{m.View, m.Seq, m.Digest}][m.Sender] = true
+	n.pendingPrepares[msgKey{m.View, m.Seq, m.Digest}][m.Sender] = m
 	n.syncEntry(m.Seq)
 }
 
@@ -522,8 +530,8 @@ func (n *Replica) syncEntry(seq uint64) {
 	}
 	// Fold matching prepares once we hold the pre-prepare.
 	k := msgKey{e.view, seq, e.digest}
-	for s := range n.pendingPrepares[k] {
-		e.prepares[s] = true
+	for s, pm := range n.pendingPrepares[k] {
+		e.prepares[s] = pm
 	}
 	delete(n.pendingPrepares, k)
 	if len(e.prepares) >= 2*n.f && !e.sentCommit {
@@ -552,7 +560,7 @@ func (n *Replica) newEntry(view, seq uint64, d string, req Request) *entry {
 		view:     view,
 		digest:   d,
 		req:      req,
-		prepares: make(map[string]bool),
+		prepares: make(map[string]*Prepare),
 		commits:  make(map[string]bool),
 	}
 }
