@@ -71,6 +71,9 @@ type Replica struct {
 	// commit-certified. It runs while the node lock is held and must not call
 	// back into the replica.
 	applyFn func(seq uint64, req Request)
+	// logStore, when set, durably persists accepted requests and the executed
+	// watermark (M4). Nil means in-memory only (unit tests).
+	logStore LogStore
 
 	mu           sync.Mutex
 	view         uint64 // current view
@@ -359,6 +362,11 @@ func (n *Replica) Submit(command []byte) (uint64, error) {
 	n.log[seq] = e
 	n.seen[reqKey{req.Client, req.Timestamp}] = d
 	n.lastAssigned = seq
+	// Durably record the order before it is acted on, so a crash does not
+	// forget a request this replica accepted.
+	if err := n.persistRequestLocked(n.view, seq, req); err != nil {
+		return 0, err
+	}
 	if len(n.peers) == 0 {
 		// A single-replica cluster (f = 0) has no peers to certify with.
 		e.sentCommit = true
@@ -440,6 +448,11 @@ func (n *Replica) HandlePrePrepare(m *PrePrepare) {
 	// Discard buffered prepares/commits for a different (equivocating) digest
 	// at this sequence: they can never match what we accepted.
 	n.dropConflictingPending(n.view, m.Seq, d)
+	// Durably record the accepted order before broadcasting the Prepare, so a
+	// crash does not forget a request this replica accepted.
+	if err := n.persistRequestLocked(n.view, m.Seq, m.Req); err != nil {
+		return // not durable: do not act on it
+	}
 	pr := &Prepare{View: n.view, Seq: m.Seq, Digest: d, Sender: n.id}
 	pr.Sig = n.sign(pr)
 	n.broadcast(func(p string) { _ = n.tr.SendPrepare(context.Background(), p, pr) })
@@ -593,5 +606,6 @@ func (n *Replica) executeReady() {
 		if n.applyFn != nil {
 			n.applyFn(seq, req)
 		}
+		n.persistAppliedLocked(seq)
 	}
 }

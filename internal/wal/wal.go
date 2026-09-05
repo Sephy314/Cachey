@@ -41,6 +41,10 @@ const (
 	// OpConfig marks a Raft configuration-change entry; Config holds the
 	// serialized membership.
 	OpConfig Op = "CONFIG"
+	// OpPBFT marks a Practical Byzantine Fault Tolerance consensus-log record;
+	// Data holds the serialized (view, seq, request) payload. Only the PBFT
+	// recovery hook consumes it; the store's FSM apply ignores it.
+	OpPBFT Op = "PBFT"
 )
 
 // Record is a single logical WAL entry. LogIndex is assigned by the writer in
@@ -50,7 +54,8 @@ const (
 // for the Raft replicated log: Term is the entry's Raft term and RaftIndex is
 // its index in the Raft log (which may repeat after a Raft truncation). They
 // are ignored by the store's FSM apply. Config is only set for OpConfig
-// records (Raft membership changes).
+// records (Raft membership changes). Data is only set for OpPBFT records and
+// carries the serialized PBFT consensus entry.
 type Record struct {
 	Op        Op     `json:"op"`
 	Key       string `json:"key"`
@@ -60,6 +65,7 @@ type Record struct {
 	Term      uint64 `json:"term,omitempty"`       // raft term (raft log entries)
 	RaftIndex uint64 `json:"raft_index,omitempty"` // raft log index (raft log entries)
 	Config    []byte `json:"config,omitempty"`     // serialized raft membership (CONFIG op)
+	Data      []byte `json:"data,omitempty"`       // serialized PBFT consensus entry (PBFT op)
 }
 
 // marshal serializes a record as one NDJSON line (including trailing newline).

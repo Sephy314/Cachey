@@ -179,7 +179,7 @@ func replayWALFile(path string, last *uint64, apply func(Record) error) error {
 
 func validateRec(rec Record, last uint64, path string) error {
 	switch rec.Op {
-	case OpPut, OpDelete, OpTTL, OpNoop, OpConfig:
+	case OpPut, OpDelete, OpTTL, OpNoop, OpConfig, OpPBFT:
 	default:
 		return fmt.Errorf("wal: unknown op %q in %s", rec.Op, path)
 	}
