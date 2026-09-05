@@ -4,7 +4,7 @@
 
 ### A **distributed** key-value cache store, written in Go
 
-*Raft-based consensus. Sharding. Built for the cluster, not just the box.*
+*Raft and PBFT consensus. Sharding. Built for the cluster, not just the box.*
 
 `Go 1.26.7` · `Experimental` · [License](LICENSE)
 
@@ -15,16 +15,23 @@
 ## 🌱 Overview
 
 Cachey is a **distributed key-value cache store** built in Go. It grows a
-replicated, consistent cluster out of a plain in-memory store: writes go
-through a **Raft leader**, are durably logged, and are applied to every
-replica the moment they commit.
+replicated, consistent cluster out of a plain in-memory store: writes are
+proposed to a consensus leader, durably logged, and applied to replicas
+only once they commit.
 
-The **Raft consensus engine** is implemented and tested end to end — leader
-election, log replication with WAL-backed durability, commit/apply, dynamic
-membership, linearizable reads, leader redirect, and snapshot/log
-compaction. The runnable `cacheyd` binary still starts a single node today;
-wiring it into a multi-node cluster is the next step before keys are sharded
-across machines.
+Two consensus engines are implemented and tested end to end:
+
+- **Raft** (`internal/raft`) — crash-fault-tolerant replication: leader
+  election, log replication with WAL-backed durability, dynamic membership,
+  linearizable reads, leader redirect, and snapshot/log compaction.
+- **PBFT** (`internal/pbft`) — Byzantine-fault-tolerant replication:
+  normal-case pre-prepare/prepare/commit ordering, Ed25519-authenticated
+  messages, view change with Byzantine-safe prepared certificates, and
+  WAL-backed recovery of the ordered log.
+
+The runnable `cacheyd` binary still starts a single node today; wiring it
+into a multi-node cluster is the next step before keys are sharded across
+machines.
 
 <br>
 
@@ -32,15 +39,16 @@ across machines.
 
 | | Area | Status |
 |---|---|---|
-| 🧠 | **Raft-based consensus** | ✅ Implemented — leader election, replication, membership, linearizable reads, snapshots |
+| 🧠 | **Raft consensus** (crash-fault tolerant) | ✅ Implemented — election, replication, membership, linearizable reads, snapshots |
+| 🧠 | **PBFT consensus** (Byzantine-fault tolerant) | ✅ Implemented — normal case, view change, Ed25519 auth, WAL recovery |
 | 🔀 | **Sharding** | 🚧 Roadmap — next after `cacheyd` cluster wiring |
-| 🛡️ | **Failure detection & recovery** | ✅ Elections/failover tested; WAL + snapshot recovery |
+| 🛡️ | **Failure detection & recovery** | ✅ Elections/view changes + failover tested; WAL + snapshot recovery |
 | 🔌 | **Stable client protocol** | ✅ NDJSON protocol + leader-redirect hints |
 
 > **Note:** the status table reflects what is implemented in this
-> repository today — the consensus *engine* and its integration tests are
-> complete, while exposing cluster mode through the `cacheyd` binary and
-> sharding keys across nodes remain on the roadmap.
+> repository today — both consensus *engines* and their integration tests
+> are complete, while exposing cluster mode through the `cacheyd` binary
+> and sharding keys across nodes remain on the roadmap.
 
 <br>
 
@@ -62,6 +70,16 @@ across machines.
 - Log compaction + `InstallSnapshot` catch-up for joining and restarting nodes
 - End-to-end cluster tests: replication, failover, restart recovery, add/remove
   membership, stale-node election loss, network partitions, snapshot restore
+
+**PBFT consensus engine** (`internal/pbft`)
+- Normal-case consensus — pre-prepare / prepare / commit with total order
+- Byzantine fault tolerance — tolerates `f` faulty replicas (`N >= 3f + 1`)
+- All messages authenticated with Ed25519 signatures; forged/tampered traffic rejected
+- View change / new view with Byzantine-safe prepared certificates
+- WAL-backed persistence of the ordered log; restart recovery
+- Primary-only writes — backups reject with `ErrNotPrimary` and advertise the primary
+- Fault-injection e2e suite: reordering, partitions, equivocation, fake commits,
+  primary silence/view change, duplicate delivery, no conflicting commit at a sequence
 
 **Quality**
 - Unit, integration, and end-to-end tests plus `-race` runs
@@ -146,10 +164,12 @@ gRPC-style status object instead:
 | `5` | `NotFound` | Missing key |
 | `12` | `Unimplemented` | Unknown command |
 
-When a node is part of a Raft cluster, a write or read sent to a
+When a node is part of a replicated cluster, a write or read sent to a
 non-leader fails with a `14` (`Unavailable`) status that carries the
 current leader's address — the Go client can extract it with
-`client.RedirectLeader(err)` and reconnect automatically.
+`client.RedirectLeader(err)` and reconnect automatically. Raft nodes expose
+this redirect over the wire; PBFT stores reject non-primary access with
+`ErrNotPrimary` and advertise the primary through `Leader()`.
 
 The Go client in `pkg/client` handles JSON serialization, newline
 framing, and status errors automatically.
@@ -196,11 +216,35 @@ Client ──▶ Handler ──▶ ClusterStore
 |---|---|
 | `internal/protocol` | Defines commands and JSON parsing |
 | `internal/raft` | Consensus core: election, replication, membership, read index, snapshots |
-| `internal/server` | TCP dispatch; `ClusterStore` adapts a raft node to `store.Store` |
-| `internal/store` | Storage interface, in-memory store, and raft FSM |
-| `internal/wal` | Durable log backend for both the store and the raft log |
+| `internal/pbft` | BFT consensus core: normal case, view change, Ed25519 auth, WAL recovery |
+| `internal/server` | TCP dispatch; `ClusterStore`/`PbftClusterStore` adapt a node to `store.Store` |
+| `internal/store` | Storage interface, in-memory store, and replicated FSM |
+| `internal/wal` | Durable log backend for the store, raft log, and pbft log |
 | `pkg/client` | TCP client with `RedirectLeader` for cluster redirects |
 | `cmd/cacheyd` | Runs a single node (`cacheyd <addr> [data-dir]`) |
+
+### PBFT-replicated store (library, tested)
+
+PBFT is the Byzantine counterpart of the raft store: writes are ordered by
+the view's **primary** through pre-prepare / prepare / commit, executed by
+every replica in sequence, and exposed to clients by
+`server.PbftClusterStore`. Backups reject writes with `pbft.ErrNotPrimary`
+and advertise the primary, and every message is Ed25519-signed so a faulty
+replica cannot equivocate undetected.
+
+```text
+Client ──▶ Handler ──▶ PbftClusterStore
+                           │
+                       PBFT Replica ──signed pre-prepare / prepare / commit──▶ peers
+                           │
+                    WAL (ordered log) ──▶ FSM (CacheyStore)
+                           │
+                 view change (on primary failure)
+```
+
+Fault-injection e2e tests cover Byzantine primaries and backups, view
+changes under primary silence, network partitions, message loss and
+reordering, and duplicate delivery.
 
 ### Target: sharded cluster (roadmap)
 
