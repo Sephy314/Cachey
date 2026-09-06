@@ -3,12 +3,15 @@ package raft
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/Sephy314/Cachey/internal/mtls"
 )
 
 // rpcTimeout bounds a single Raft RPC round-trip over TCP.
@@ -42,6 +45,17 @@ type TCPTransport struct {
 	connMu    sync.Mutex
 	stopCh    chan struct{}
 	doneCh    chan struct{}
+
+	// mTLS (see EnableTLS). When tlsOn, the listener wraps connections in TLS
+	// and outbound dials present our cert and pin the peer's identity.
+	// peerTLS caches one client *tls.Config per peer; serverTLS is the
+	// listener config, built once at Listen.
+	tlsOn     bool
+	tlsCA     []byte
+	tlsCert   []byte
+	tlsKey    []byte
+	peerTLS   map[string]*tls.Config
+	serverTLS *tls.Config
 
 	// fault, when non-nil, drops outbound RPCs from this node to a target
 	// (network-partition simulation for tests).
@@ -108,6 +122,14 @@ func (t *TCPTransport) Listen(addr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if t.tlsEnabled() {
+		cfg, err := t.serverTLSConfig()
+		if err != nil {
+			ln.Close()
+			return "", err
+		}
+		ln = tls.NewListener(ln, cfg)
+	}
 	t.ln = ln
 	t.addr = ln.Addr().String()
 	go t.acceptLoop()
@@ -116,6 +138,85 @@ func (t *TCPTransport) Listen(addr string) (string, error) {
 
 // Addr returns the bound listen address ("" if not listening).
 func (t *TCPTransport) Addr() string { return t.addr }
+
+// EnableTLS turns on mutual TLS for every Raft RPC. This node identifies
+// itself with certPEM/keyPEM (whose DNS SAN must be this node's id, see
+// internal/mtls) and requires every peer to present a certificate signed by
+// caPEM whose DNS SAN is a known node id. It must be called before Listen.
+// Plaintext stays the default (tests and local development).
+func (t *TCPTransport) EnableTLS(caPEM, certPEM, keyPEM []byte) {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	t.tlsOn = true
+	t.tlsCA = caPEM
+	t.tlsCert = certPEM
+	t.tlsKey = keyPEM
+	t.peerTLS = make(map[string]*tls.Config)
+}
+
+func (t *TCPTransport) tlsEnabled() bool {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	return t.tlsOn
+}
+
+// serverTLSConfig builds (once) the listener's *tls.Config. Its accept
+// predicate reads the live peer map, so dynamically added members are
+// admitted without rebuilding the config.
+func (t *TCPTransport) serverTLSConfig() (*tls.Config, error) {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	if t.serverTLS != nil {
+		return t.serverTLS, nil
+	}
+	cfg, err := mtls.Server(t.tlsCA, t.tlsCert, t.tlsKey, t.acceptPeer)
+	if err != nil {
+		return nil, err
+	}
+	t.serverTLS = cfg
+	return cfg, nil
+}
+
+// acceptPeer reports whether an inbound certificate's identity (its DNS SAN)
+// belongs to a known node: this node or a configured peer.
+func (t *TCPTransport) acceptPeer(identity string) bool {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	if t.node != nil && identity == t.node.ID() {
+		return true
+	}
+	_, known := t.peerAddrs[identity]
+	return known
+}
+
+// peerTLSConfig returns the cached client *tls.Config for dialing peer,
+// pinning the peer's expected identity (its node id) via ServerName.
+func (t *TCPTransport) peerTLSConfig(peer string) (*tls.Config, error) {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	if c, ok := t.peerTLS[peer]; ok {
+		return c, nil
+	}
+	cfg, err := mtls.Client(t.tlsCA, t.tlsCert, t.tlsKey, peer)
+	if err != nil {
+		return nil, err
+	}
+	t.peerTLS[peer] = cfg
+	return cfg, nil
+}
+
+// dialPeer dials peer at addr, wrapping the connection in TLS when enabled:
+// the peer must present a certificate signed by our CA whose DNS SAN is peer.
+func (t *TCPTransport) dialPeer(addr, peer string) (net.Conn, error) {
+	if !t.tlsEnabled() {
+		return net.DialTimeout("tcp", addr, rpcTimeout)
+	}
+	cfg, err := t.peerTLSConfig(peer)
+	if err != nil {
+		return nil, err
+	}
+	return mtls.Dial("tcp", addr, cfg, rpcTimeout)
+}
 
 func (t *TCPTransport) acceptLoop() {
 	defer close(t.doneCh)
@@ -276,29 +377,37 @@ func (t *TCPTransport) roundTrip(ctx context.Context, peer, reqKind string, req,
 	return nil
 }
 
-// peerConn returns the persistent connection to peer, dialing if needed.
+// peerConn returns the persistent connection to peer, dialing if needed. The
+// dial and any TLS handshake happen outside connMu: the peer's identity
+// callback and this node's own inbound accept both take connMu, so holding it
+// across a handshake would deadlock concurrent node-to-node dials. Dials to
+// the same peer are serialized by the per-peer pc.mu.
 func (t *TCPTransport) peerConn(peer string) (*peerConn, error) {
 	t.connMu.Lock()
-	defer t.connMu.Unlock()
-	if pc, ok := t.conns[peer]; ok {
-		pc.mu.Lock()
-		open := pc.conn != nil
-		pc.mu.Unlock()
-		if open {
-			return pc, nil
+	pc := t.conns[peer]
+	if pc == nil {
+		addr, ok := t.peerAddrs[peer]
+		if !ok {
+			t.connMu.Unlock()
+			return nil, errors.New("raft: no address for peer " + peer)
 		}
-		delete(t.conns, peer) // stale closed conn: redial
+		pc = &peerConn{addr: addr}
+		t.conns[peer] = pc
 	}
-	addr, ok := t.peerAddrs[peer]
-	if !ok {
-		return nil, errors.New("raft: no address for peer " + peer)
+	addr := pc.addr
+	t.connMu.Unlock()
+
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	if pc.conn != nil {
+		return pc, nil
 	}
-	conn, err := net.DialTimeout("tcp", addr, rpcTimeout)
+	conn, err := t.dialPeer(addr, peer)
 	if err != nil {
 		return nil, err
 	}
-	pc := &peerConn{conn: conn, rd: bufio.NewReader(conn)}
-	t.conns[peer] = pc
+	pc.conn = conn
+	pc.rd = bufio.NewReader(conn)
 	return pc, nil
 }
 
@@ -335,6 +444,7 @@ func (t *TCPTransport) Close() error {
 // serialized by mu so wire frames never interleave, and conn is only touched
 // while mu is held.
 type peerConn struct {
+	addr string
 	conn net.Conn
 	rd   *bufio.Reader
 	mu   sync.Mutex
