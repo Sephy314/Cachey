@@ -1,4 +1,13 @@
-package mtls
+// Package testca provides a throwaway self-signed certificate authority for
+// minting the identity certificates used by the mTLS tests (and by operators
+// who want one, though cacheyd deliberately ships no certificate-generation
+// command — production deployments bring their own CA).
+//
+// Keeping CA and private-key generation here, and importing this package only
+// from tests, means the CA-generation code never ends up in a runtime binary:
+// the runtime internal/mtls package only consumes certificates and never
+// creates one.
+package testca
 
 import (
 	"crypto/ecdsa"
@@ -10,12 +19,11 @@ import (
 	"fmt"
 	"math/big"
 	"time"
+
+	"github.com/Sephy314/Cachey/internal/mtls"
 )
 
 // CA is a self-signed certificate authority for minting identity certificates.
-// Tests use it to build throwaway CAs and role certificates; operators can use
-// it too, though cacheyd does not expose a generate command — production
-// deployments are expected to bring their own CA and certificates.
 type CA struct {
 	certPEM, keyPEM []byte
 	key             *ecdsa.PrivateKey
@@ -30,7 +38,7 @@ func NewCA() (*CA, error) {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "Cachey CA"},
+		Subject:               pkix.Name{CommonName: "Cachey test CA"},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
@@ -58,19 +66,32 @@ func NewCA() (*CA, error) {
 func (ca *CA) CertPEM() []byte { return ca.certPEM }
 
 // Issue mints a leaf certificate whose DNS SAN is identity — the principal's
-// name (a consensus node id, cache server name, or cache client name). The
-// leaf carries both server and client EKUs; which role it may actually play is
-// decided by the allowlists at each listener.
+// name (a consensus node id, cache server name, or cache client name).
 func (ca *CA) Issue(identity string) (certPEM, keyPEM []byte, err error) {
 	now := time.Now()
 	return ca.issue(identity, now.Add(-time.Hour), now.Add(10*365*24*time.Hour), []string{identity})
 }
 
-// issue is Issue with an explicit validity window and DNS SAN list. Tests use
-// it to mint certificates that are expired or that carry no identity SAN.
+// IssueExpired mints a leaf (identity as its DNS SAN) that has already expired,
+// for negative tests.
+func (ca *CA) IssueExpired(identity string) (certPEM, keyPEM []byte, err error) {
+	now := time.Now()
+	return ca.issue(identity, now.Add(-48*time.Hour), now.Add(-24*time.Hour), []string{identity})
+}
+
+// IssueNoSAN mints a leaf that carries no identity SAN (only the given name in
+// its CommonName), for the test that a certificate without a SAN cannot
+// authenticate.
+func (ca *CA) IssueNoSAN(name string) (certPEM, keyPEM []byte, err error) {
+	now := time.Now()
+	return ca.issue(name, now.Add(-time.Hour), now.Add(time.Hour), nil)
+}
+
+// issue is the shared leaf issuer with an explicit validity window and DNS SAN
+// list.
 func (ca *CA) issue(identity string, notBefore, notAfter time.Time, dnsNames []string) (certPEM, keyPEM []byte, err error) {
-	if !ValidName(identity) {
-		return nil, nil, fmt.Errorf("mtls: identity %q is not a valid DNS name", identity)
+	if !mtls.ValidName(identity) {
+		return nil, nil, fmt.Errorf("testca: identity %q is not a valid DNS name", identity)
 	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

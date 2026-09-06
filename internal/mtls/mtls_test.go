@@ -1,4 +1,4 @@
-package mtls
+package mtls_test
 
 import (
 	"crypto/tls"
@@ -8,23 +8,26 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/Sephy314/Cachey/internal/mtls"
+	"github.com/Sephy314/Cachey/internal/mtls/testca"
 )
 
 func TestValidName(t *testing.T) {
 	for _, name := range []string{"r1", "alice", "n1", "cachey-1", "a.b.example"} {
-		if !ValidName(name) {
+		if !mtls.ValidName(name) {
 			t.Errorf("ValidName(%q) = false, want true", name)
 		}
 	}
 	for _, name := range []string{"", "under_score", "-lead", "trail-", "a..b", "cachey://node/r1", "r 1"} {
-		if ValidName(name) {
+		if mtls.ValidName(name) {
 			t.Errorf("ValidName(%q) = true, want false", name)
 		}
 	}
 }
 
 func TestIdentityFromDNSName(t *testing.T) {
-	ca, err := NewCA()
+	ca, err := testca.NewCA()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +40,7 @@ func TestIdentityFromDNSName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := Identity(leaf); got != "srv" {
+	if got := mtls.Identity(leaf); got != "srv" {
 		t.Fatalf("Identity = %q, want srv", got)
 	}
 }
@@ -45,9 +48,9 @@ func TestIdentityFromDNSName(t *testing.T) {
 // runServer starts an mTLS echo listener that admits clients passing accept,
 // and returns its address. Each accepted connection reads one byte and echoes
 // it back, so a client can tell acceptance from rejection by a round trip.
-func runServer(t *testing.T, ca *CA, certPEM, keyPEM []byte, accept func(string) bool) string {
+func runServer(t *testing.T, ca *testca.CA, certPEM, keyPEM []byte, accept func(string) bool) string {
 	t.Helper()
-	cfg, err := Server(ca.CertPEM(), certPEM, keyPEM, accept)
+	cfg, err := mtls.Server(ca.CertPEM(), certPEM, keyPEM, accept)
 	if err != nil {
 		t.Fatalf("Server: %v", err)
 	}
@@ -85,12 +88,12 @@ func runServer(t *testing.T, ca *CA, certPEM, keyPEM []byte, accept func(string)
 // round trip. TLS 1.3 surfaces a server-side client-cert rejection only when
 // the client first reads, so a successful handshake alone is not proof of
 // acceptance — a full round trip is.
-func tryRoundTrip(ca *CA, certPEM, keyPEM []byte, want, addr string) error {
-	cfg, err := Client(ca.CertPEM(), certPEM, keyPEM, want)
+func tryRoundTrip(ca *testca.CA, certPEM, keyPEM []byte, want, addr string) error {
+	cfg, err := mtls.Client(ca.CertPEM(), certPEM, keyPEM, want)
 	if err != nil {
 		return err
 	}
-	conn, err := Dial("tcp", addr, cfg, 2*time.Second)
+	conn, err := mtls.Dial("tcp", addr, cfg, 2*time.Second)
 	if err != nil {
 		return err
 	}
@@ -112,7 +115,7 @@ func tryRoundTrip(ca *CA, certPEM, keyPEM []byte, want, addr string) error {
 }
 
 func TestMTLSAllowlistAndPinning(t *testing.T) {
-	ca, err := NewCA()
+	ca, err := testca.NewCA()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,15 +146,22 @@ func TestMTLSAllowlistAndPinning(t *testing.T) {
 	}
 
 	// A certificate from a foreign CA must not pass, even with a matching name.
-	evilCA, _ := NewCA()
+	evilCA, _ := testca.NewCA()
 	evilCert, evilKey, _ := evilCA.Issue("r1")
 	if err := tryRoundTrip(evilCA, evilCert, evilKey, "srv", addr); err == nil {
 		t.Fatal("a foreign-CA certificate should be rejected")
 	}
 }
 
+// TestClientWithoutCertificateRejected pins that a TLS client presenting no
+// certificate is refused. Where the refusal surfaces depends on the TLS
+// version: under TLS 1.2 the server verifies the client certificate before
+// sending its Finished, so the client handshake itself fails; under TLS 1.3
+// the server sends its Finished first and only then rejects the empty client
+// certificate, so the client handshake completes and the rejection appears on
+// the first read. Either way the client must never be able to exchange data.
 func TestClientWithoutCertificateRejected(t *testing.T) {
-	ca, err := NewCA()
+	ca, err := testca.NewCA()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,20 +178,24 @@ func TestClientWithoutCertificateRejected(t *testing.T) {
 		ServerName: "srv",
 		MinVersion: tls.VersionTLS12,
 	})
-	if err := conn.Handshake(); err == nil {
-		// TLS 1.3 completes the client handshake before the server rejects the
-		// missing client certificate; the rejection then shows up on the first
-		// read. Either way the client must not be able to exchange data.
-		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
-		buf := make([]byte, 1)
-		if _, err := conn.Read(buf); err == nil {
-			t.Fatal("a client without a certificate should not be able to exchange data")
-		}
+
+	if err := conn.Handshake(); err != nil {
+		// TLS 1.2 path: rejected during the handshake itself.
+		return
+	}
+	// TLS 1.3 path: the handshake completed, so the rejection must surface on
+	// the first read — the client must not receive a usable response.
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("a client without a certificate must be rejected on the first read")
 	}
 }
 
 func TestPlaintextAgainstTLSListenerFails(t *testing.T) {
-	ca, err := NewCA()
+	ca, err := testca.NewCA()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,13 +222,12 @@ func TestPlaintextAgainstTLSListenerFails(t *testing.T) {
 // TestMTLSRejectsExpiredCert pins that a same-CA client certificate that is no
 // longer valid is refused even though its identity SAN is fine.
 func TestMTLSRejectsExpiredCert(t *testing.T) {
-	ca, err := NewCA()
+	ca, err := testca.NewCA()
 	if err != nil {
 		t.Fatal(err)
 	}
 	srvCert, srvKey, _ := ca.Issue("srv")
-	now := time.Now()
-	expiredCert, expiredKey, _ := ca.issue("r1", now.Add(-48*time.Hour), now.Add(-24*time.Hour), []string{"r1"})
+	expiredCert, expiredKey, _ := ca.IssueExpired("r1")
 
 	addr := runServer(t, ca, srvCert, srvKey, nil)
 	if err := tryRoundTrip(ca, expiredCert, expiredKey, "srv", addr); err == nil {
@@ -226,12 +239,12 @@ func TestMTLSRejectsExpiredCert(t *testing.T) {
 // for the right purpose but carrying no identity SAN is refused: a principal's
 // identity must come from the SAN, so a bare certificate cannot authenticate.
 func TestMTLSRejectsCertWithoutIdentitySAN(t *testing.T) {
-	ca, err := NewCA()
+	ca, err := testca.NewCA()
 	if err != nil {
 		t.Fatal(err)
 	}
 	srvCert, srvKey, _ := ca.Issue("srv")
-	noSANCert, noSANKey, _ := ca.issue("r1", time.Now().Add(-time.Hour), time.Now().Add(time.Hour), nil)
+	noSANCert, noSANKey, _ := ca.IssueNoSAN("r1")
 
 	addr := runServer(t, ca, srvCert, srvKey, nil)
 	if err := tryRoundTrip(ca, noSANCert, noSANKey, "srv", addr); err == nil {
@@ -239,11 +252,11 @@ func TestMTLSRejectsCertWithoutIdentitySAN(t *testing.T) {
 	}
 }
 
-func mustPool(t *testing.T, ca *CA) *x509.CertPool {
+func mustPool(t *testing.T, ca *testca.CA) *x509.CertPool {
 	t.Helper()
-	p, err := pool(ca.CertPEM())
-	if err != nil {
-		t.Fatal(err)
+	p := x509.NewCertPool()
+	if !p.AppendCertsFromPEM(ca.CertPEM()) {
+		t.Fatal("testca: no certificates in CA PEM")
 	}
 	return p
 }

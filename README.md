@@ -128,7 +128,8 @@ cacheyd --tls-ca ca.pem --tls-cert server.pem --tls-key server-key.pem \
 
 `--allow-client` names an identity (the certificate's DNS SAN) a client may
 present; repeat the flag to admit more clients. Certificates must be issued so
-their DNS SAN carries the identity (see `internal/mtls` for a test CA helper).
+their DNS SAN carries the identity (see `internal/mtls/testca` for a test-only
+CA helper).
 
 **2. Connect with a client**
 

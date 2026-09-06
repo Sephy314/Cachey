@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Sephy314/Cachey/internal/mtls"
+	"github.com/Sephy314/Cachey/internal/mtls/testca"
 	"github.com/Sephy314/Cachey/internal/protocol"
 	"github.com/Sephy314/Cachey/internal/store"
 	"github.com/Sephy314/Cachey/pkg/client"
@@ -16,7 +17,7 @@ import (
 // client of the same CA, a plaintext client, and a client pinning the wrong
 // server identity cannot exchange data.
 func TestServerMTLS(t *testing.T) {
-	ca, err := mtls.NewCA()
+	ca, err := testca.NewCA()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,9 +103,9 @@ func TestServerMTLS(t *testing.T) {
 // startMTLSServer boots a single-node cache server over mTLS that admits only
 // the given client identities (server identity "srv") and returns its address
 // plus the signing CA.
-func startMTLSServer(t *testing.T, allowed ...string) (addr string, ca *mtls.CA) {
+func startMTLSServer(t *testing.T, allowed ...string) (addr string, ca *testca.CA) {
 	t.Helper()
-	ca, err := mtls.NewCA()
+	ca, err := testca.NewCA()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +135,7 @@ func startMTLSServer(t *testing.T, allowed ...string) (addr string, ca *mtls.CA)
 // while presenting cert/key. It returns the dial error so callers can treat a
 // handshake-time rejection (which TLS 1.2 surfaces) the same as a
 // post-handshake one (which TLS 1.3 surfaces on first I/O).
-func mtlsConnect(ca *mtls.CA, certPEM, keyPEM []byte, addr string) (*client.Client, error) {
+func mtlsConnect(ca *testca.CA, certPEM, keyPEM []byte, addr string) (*client.Client, error) {
 	ccfg, err := mtls.Client(ca.CertPEM(), certPEM, keyPEM, "srv")
 	if err != nil {
 		return nil, err
@@ -153,7 +154,7 @@ func mtlsPut(c *client.Client, k, v string) bool {
 func TestServerMTLSRejectsForeignCA(t *testing.T) {
 	addr, ca := startMTLSServer(t, "alice")
 
-	foreign, err := mtls.NewCA()
+	foreign, err := testca.NewCA()
 	if err != nil {
 		t.Fatal(err)
 	}

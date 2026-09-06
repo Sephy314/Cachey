@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Sephy314/Cachey/internal/mtls"
+	"github.com/Sephy314/Cachey/internal/mtls/testca"
 )
 
 // TestTCPClusterTLS runs a real 4-replica PBFT cluster with mutual TLS on
@@ -14,7 +14,7 @@ import (
 // must still be reached.
 func TestTCPClusterTLS(t *testing.T) {
 	ids := []string{"r0", "r1", "r2", "r3"}
-	ca, err := mtls.NewCA()
+	ca, err := testca.NewCA()
 	if err != nil {
 		t.Fatal(err)
 	}

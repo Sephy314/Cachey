@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Sephy314/Cachey/internal/mtls"
+	"github.com/Sephy314/Cachey/internal/mtls/testca"
 )
 
 // TestTCPClusterTLS runs a real 3-node Raft cluster with mutual TLS on every
@@ -13,7 +13,7 @@ import (
 // admits only known node identities.
 func TestTCPClusterTLS(t *testing.T) {
 	ids := []string{"a", "b", "c"}
-	ca, err := mtls.NewCA()
+	ca, err := testca.NewCA()
 	if err != nil {
 		t.Fatal(err)
 	}
