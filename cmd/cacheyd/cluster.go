@@ -1,14 +1,12 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -18,18 +16,6 @@ import (
 	"github.com/Sephy314/Cachey/pkg/client"
 )
 
-// memberPrefix keys the replicated registry that maps a node id to its
-// client-facing address. The leader writes member/<id> when a node bootstraps
-// or joins, so every node's FSM keeps the full table and can answer "not
-// leader: <addr>" redirects for clients. The prefix is reserved: the cluster
-// handler rejects ordinary client commands that touch it.
-//
-// ponytail: the member table lives in the data namespace (reserved keys)
-// rather than a separate metadata log; a store snapshot therefore captures it
-// with the data. A client that knows the prefix could still read it over the
-// raw protocol if it bypasses this handler — acceptable for a cache cluster.
-const memberPrefix = "member/"
-
 const (
 	raftHeartbeat = 100 * time.Millisecond
 	raftElection  = 600 * time.Millisecond // randomized 600-1200ms, see raft tests
@@ -37,26 +23,27 @@ const (
 
 // clusterFlags holds the -consensus raft command-line options.
 type clusterFlags struct {
-	nodeID     string
-	clientAddr string
-	raftAddr   string
-	dataDir    string
-	bootstrap  bool
-	join       string
+	nodeID      string
+	clientAddr  string // client-facing (data plane)
+	controlAddr string // cluster control plane (JOIN)
+	raftAddr    string
+	dataDir     string
+	bootstrap   bool
+	join        string // an existing member's CONTROL address to join through
 }
 
 // runRaftCluster opens a persistent raft node, attaches a client-facing server
 // over it, and either bootstraps a fresh cluster or joins an existing one,
 // then serves until SIGINT/SIGTERM.
 func runRaftCluster(cf *clusterFlags, opts []server.Option) error {
-	if cf.nodeID == "" || cf.clientAddr == "" || cf.raftAddr == "" || cf.dataDir == "" {
-		return fmt.Errorf("-consensus raft requires -node-id, -client-addr, -raft-addr and -data-dir")
+	if cf.nodeID == "" || cf.clientAddr == "" || cf.controlAddr == "" || cf.raftAddr == "" || cf.dataDir == "" {
+		return fmt.Errorf("-consensus raft requires -node-id, -client-addr, -control-addr, -raft-addr and -data-dir")
 	}
 	if cf.bootstrap && cf.join != "" {
 		return errors.New("use either -bootstrap or -join, not both")
 	}
 	if !cf.bootstrap && cf.join == "" {
-		return errors.New("-consensus raft needs -bootstrap (first node) or -join <member-client-addr>")
+		return errors.New("-consensus raft needs -bootstrap (first node) or -join <member-control-addr>")
 	}
 
 	rn, err := server.OpenRaftNode(server.RaftNodeConfig{
@@ -72,67 +59,47 @@ func runRaftCluster(cf *clusterFlags, opts []server.Option) error {
 	defer rn.Stop()
 	rn.Store.StartActiveExpiration(1 * time.Second)
 
-	// Redirects: resolve a leader's node id to its client address from the
-	// replicated member table every node keeps in its FSM.
+	// Data-plane redirects: resolve a leader's node id to its client address
+	// from the replicated member table every node keeps in its FSM.
 	rn.CS.SetLeaderResolver(func(id string) string {
 		if id == "" {
 			return ""
 		}
-		v, err := rn.Store.Get(memberPrefix + id)
-		if err != nil {
-			return ""
+		if v, err := rn.Store.Get(server.MemberKey(id)); err == nil {
+			return *v
 		}
-		return *v
+		return ""
 	})
 
-	hdl := &clusterHandler{
-		node: rn.Node,
-		cs:   rn.CS,
-		base: server.NewCacheyHandler(rn.CS),
-	}
-	srv := server.NewServer(cf.clientAddr, hdl, opts...)
-	if err := srv.Start(); err != nil {
-		return fmt.Errorf("start client server on %s: %w", cf.clientAddr, err)
-	}
-	defer srv.Stop()
-
-	if cf.bootstrap {
+	switch {
+	case cf.bootstrap:
 		// First node of a new cluster (or a member restarting from an existing
 		// data dir — recovery restores membership; -bootstrap means "go live
-		// and register my own client address").
+		// and register my own addresses").
 		rn.Node.Run()
-		if err := waitFor("this node to lead and register its client address", 30*time.Second, func() error {
-			if !rn.Node.IsLeader() {
-				return errRetry
-			}
-			if err := rn.CS.Put(memberPrefix+rn.ID, cf.clientAddr); err != nil {
-				if errors.Is(err, raft.ErrNotLeader) {
-					return errRetry
-				}
-				return err
-			}
-			return nil
-		}); err != nil {
+		if err := registerSelf(rn, cf); err != nil {
 			return err
 		}
-	} else if hasWALData(cf.dataDir) {
+	case hasWALData(cf.dataDir):
 		// Restarting an existing member: recovery restores membership, so just
-		// go live; -join re-announces the client address through the leader.
+		// go live; -join re-announces this node's addresses through the leader.
 		rn.Node.Run()
-		if err := joinCluster(rn, cf.clientAddr, cf.join); err != nil {
+		if err := joinCluster(rn, cf, cf.join); err != nil {
 			return err
 		}
-	} else {
+	default:
 		// A brand-new node joining an existing cluster must be added by the
 		// leader (raft.AddServer) BEFORE it runs, so it never briefly
 		// self-elects as a 1-node cluster.
-		if err := joinCluster(rn, cf.clientAddr, cf.join); err != nil {
+		if err := joinCluster(rn, cf, cf.join); err != nil {
 			return err
 		}
 		rn.Node.Run()
 		if err := waitFor("the cluster to catch this node up", 60*time.Second, func() error {
-			v, err := rn.Store.Get(memberPrefix + rn.ID)
-			if err != nil || *v != cf.clientAddr {
+			if v, err := rn.Store.Get(server.MemberKey(rn.ID)); err != nil || *v != cf.clientAddr {
+				return errRetry
+			}
+			if v, err := rn.Store.Get(server.ControlKey(rn.ID)); err != nil || *v != cf.controlAddr {
 				return errRetry
 			}
 			return nil
@@ -141,14 +108,51 @@ func runRaftCluster(cf *clusterFlags, opts []server.Option) error {
 		}
 	}
 
-	fmt.Printf("cacheyd: node %s ready (raft %s, client %s, data %s)\n",
-		rn.ID, rn.RaftAddr, cf.clientAddr, cf.dataDir)
+	// Start the two planes only once this node is a member: the client-facing
+	// DATA server and the separate CONTROL server (JOIN). The control endpoint
+	// is where membership changes happen — never on the data endpoint.
+	dataSrv := server.NewServer(cf.clientAddr, server.NewClusterHandler(rn.CS), opts...)
+	if err := dataSrv.Start(); err != nil {
+		return fmt.Errorf("start client server on %s: %w", cf.clientAddr, err)
+	}
+	defer dataSrv.Stop()
+	ctlSrv := server.NewServer(cf.controlAddr, server.NewControlHandler(rn.Node, rn.CS, rn.Store), opts...)
+	if err := ctlSrv.Start(); err != nil {
+		return fmt.Errorf("start control server on %s: %w", cf.controlAddr, err)
+	}
+	defer ctlSrv.Stop()
+
+	fmt.Printf("cacheyd: node %s ready (raft %s, client %s, control %s, data %s)\n",
+		rn.ID, rn.RaftAddr, cf.clientAddr, cf.controlAddr, cf.dataDir)
 
 	// Serve until SIGINT/SIGTERM, then shut down cleanly (see defers above).
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
 	return nil
+}
+
+// registerSelf waits until this node is the leader of its (single-node or
+// recovered) cluster, then registers its own client and control addresses in
+// the replicated registry.
+func registerSelf(rn *server.RaftNode, cf *clusterFlags) error {
+	return waitFor("this node to lead and register its addresses", 30*time.Second, func() error {
+		if !rn.Node.IsLeader() {
+			return errRetry
+		}
+		for key, addr := range map[string]string{
+			server.MemberKey(rn.ID):  cf.clientAddr,
+			server.ControlKey(rn.ID): cf.controlAddr,
+		} {
+			if err := rn.CS.Put(key, addr); err != nil {
+				if errors.Is(err, raft.ErrNotLeader) {
+					return errRetry
+				}
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // hasWALData reports whether dir already holds a raft log or snapshot (i.e.
@@ -160,92 +164,6 @@ func hasWALData(dir string) bool {
 		}
 	}
 	return false
-}
-
-// clusterHandler is the client-facing handler of a raft-cluster node. It
-// intercepts the JOIN control command (used to add nodes) and guards the
-// reserved member/ registry keys, delegating every ordinary cache command to
-// CacheyHandler over the replicated ClusterStore.
-type clusterHandler struct {
-	node *raft.Node
-	cs   *server.ClusterStore
-	base *server.CacheyHandler
-}
-
-func (h *clusterHandler) HandleRequest(data []byte) ([]byte, error) {
-	cmd, err := protocol.DeSerializeCommand(data)
-	if err != nil {
-		return nil, err
-	}
-	if cmd.Type == protocol.JOIN {
-		return h.handleJoin(cmd)
-	}
-	switch cmd.Type {
-	case protocol.GET, protocol.PUT, protocol.DEL, protocol.TTL:
-		if strings.HasPrefix(cmd.Key, memberPrefix) {
-			return nil, protocol.Statusf(protocol.CodeInvalidArgument, "key %q is reserved", cmd.Key)
-		}
-	}
-	// Ordinary cache command: let CacheyHandler decode and dispatch.
-	return h.base.HandleRequest(data)
-}
-
-// joinPayload is the body of a JOIN request: the joining node's raft RPC
-// address (so the leader can replicate to it) and its client address (so the
-// cluster can redirect clients to it).
-type joinPayload struct {
-	Raft   string `json:"raft"`
-	Client string `json:"client"`
-}
-
-// handleJoin runs on the node that received a JOIN. Only the raft leader may
-// add the newcomer: it calls raft.AddServer (idempotent for an existing
-// member, which just re-announces) and writes the member's client address into
-// the replicated registry. A follower answers with a leader redirect so the
-// joining process retries against the actual leader.
-func (h *clusterHandler) handleJoin(cmd *protocol.Command) ([]byte, error) {
-	var p joinPayload
-	if cmd.Key == "" || json.Unmarshal([]byte(cmd.Val), &p) != nil || p.Raft == "" || p.Client == "" {
-		return nil, protocol.Statusf(protocol.CodeInvalidArgument, "malformed join request")
-	}
-	if !h.node.IsLeader() {
-		return nil, h.redirect()
-	}
-	already := false
-	for _, id := range h.node.Voters() {
-		if id == cmd.Key {
-			already = true
-			break
-		}
-	}
-	if !already {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := h.node.AddServer(ctx, cmd.Key, p.Raft)
-		cancel()
-		if err != nil {
-			if errors.Is(err, raft.ErrNotLeader) {
-				return nil, h.redirect()
-			}
-			return nil, protocol.Statusf(protocol.CodeInternal, "add %s: %v", cmd.Key, err)
-		}
-	}
-	if err := h.cs.Put(memberPrefix+cmd.Key, p.Client); err != nil {
-		if errors.Is(err, raft.ErrNotLeader) {
-			return nil, h.redirect()
-		}
-		return nil, protocol.Statusf(protocol.CodeInternal, "register %s: %v", cmd.Key, err)
-	}
-	// Echo the JOIN back as the acknowledgement.
-	return cmd.Serialize()
-}
-
-// redirect builds the leader-redirect status this node answers with when it is
-// not the leader. The hint carries the leader's client address when known.
-func (h *clusterHandler) redirect() error {
-	if addr := h.cs.Leader(); addr != "" {
-		return protocol.Statusf(protocol.CodeUnavailable, "not leader: %s", addr)
-	}
-	return protocol.Statusf(protocol.CodeUnavailable, "not leader")
 }
 
 // errRetry marks a condition that has not succeeded yet but is worth polling
@@ -271,12 +189,16 @@ func waitFor(what string, timeout time.Duration, cond func() error) error {
 	}
 }
 
-// joinCluster asks an existing member (contact's client address) to add this
-// node to the cluster, following "not leader: <addr>" redirects until the
-// current leader acknowledges. Idempotent for a member that already exists:
-// the leader then just refreshes its client address.
-func joinCluster(rn *server.RaftNode, selfClientAddr, contact string) error {
-	payload, err := json.Marshal(joinPayload{Raft: rn.RaftAddr, Client: selfClientAddr})
+// joinCluster asks an existing member's CONTROL endpoint (contact) to add this
+// node, following "not leader: <control addr>" redirects until the current
+// leader acknowledges. Idempotent for an existing member: the leader then just
+// refreshes this node's addresses.
+func joinCluster(rn *server.RaftNode, cf *clusterFlags, contact string) error {
+	payload, err := json.Marshal(server.JoinRequest{
+		Raft:    rn.RaftAddr,
+		Client:  cf.clientAddr,
+		Control: cf.controlAddr,
+	})
 	if err != nil {
 		return err
 	}
@@ -298,7 +220,7 @@ func joinCluster(rn *server.RaftNode, selfClientAddr, contact string) error {
 		var st *protocol.Status
 		switch {
 		case errors.As(err, &st) && st.Code == protocol.CodeUnavailable:
-			return errRetry // leader unknown yet (member table not ready)
+			return errRetry // leader unknown yet (registry not ready)
 		case errors.As(err, &st):
 			return err // a definitive server verdict (e.g. not a cluster node)
 		default:

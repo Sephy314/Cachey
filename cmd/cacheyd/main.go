@@ -33,6 +33,7 @@ func main() {
 	consensus := fs.String("consensus", "", "cluster consensus engine: \"\" (standalone) or \"raft\" (pbft/hotstuff not yet)")
 	nodeID := fs.String("node-id", "", "this node's unique id in the cluster (raft cluster)")
 	clientAddr := fs.String("client-addr", "", "client-facing NDJSON listen address, e.g. 127.0.0.1:8081 (raft cluster)")
+	controlAddr := fs.String("control-addr", "", "cluster control-plane (JOIN) listen address, e.g. 127.0.0.1:8082 (raft cluster)")
 	raftAddr := fs.String("raft-addr", "", "raft RPC listen address, e.g. 127.0.0.1:9101 (raft cluster)")
 	dataDir := fs.String("data-dir", "", "data directory for the raft log and snapshots (raft cluster)")
 	bootstrap := fs.Bool("bootstrap", false, "start a brand-new raft cluster as its first node (raft cluster)")
@@ -50,7 +51,7 @@ func main() {
 			fs.Usage()
 			os.Exit(1)
 		}
-		if *nodeID != "" || *clientAddr != "" || *raftAddr != "" || *dataDir != "" || *bootstrap || *join != "" {
+		if *nodeID != "" || *clientAddr != "" || *controlAddr != "" || *raftAddr != "" || *dataDir != "" || *bootstrap || *join != "" {
 			fmt.Fprintln(os.Stderr, "cacheyd: cluster flags require -consensus raft")
 			os.Exit(1)
 		}
@@ -65,12 +66,13 @@ func main() {
 			os.Exit(1)
 		}
 		cf := &clusterFlags{
-			nodeID:     *nodeID,
-			clientAddr: *clientAddr,
-			raftAddr:   *raftAddr,
-			dataDir:    *dataDir,
-			bootstrap:  *bootstrap,
-			join:       *join,
+			nodeID:      *nodeID,
+			clientAddr:  *clientAddr,
+			controlAddr: *controlAddr,
+			raftAddr:    *raftAddr,
+			dataDir:     *dataDir,
+			bootstrap:   *bootstrap,
+			join:        *join,
 		}
 		if err := runRaftCluster(cf, opts); err != nil {
 			fmt.Fprintln(os.Stderr, "cacheyd:", err)
@@ -91,13 +93,14 @@ func usage(fs *flag.FlagSet) {
 
 Usage:
   cacheyd <address> [data-dir] [flags]                        standalone single node
-  cacheyd -consensus raft -node-id N -client-addr A \
+  cacheyd -consensus raft -node-id N -client-addr A -control-addr C \
           -raft-addr R -data-dir D (-bootstrap | -join ADDR)  replicated raft cluster
 
 The first cluster node is started with -bootstrap; each later node joins by
-pointing -join at any existing member's client address (ADDR above). Client
-connections are mTLS by default; pass -insecure-plaintext for local
-development without TLS.
+pointing -join at any existing member's CONTROL address (C/ADDR above).
+Client connections are mTLS by default; pass -insecure-plaintext for local
+development without TLS. Membership changes (JOIN) are served only on the
+separate control endpoint, never on the client-facing one.
 
 Flags:
 `)

@@ -172,18 +172,22 @@ described in [Protocol](#-protocol) below.
 
 Bring up a replicated cluster of `cacheyd` processes with `-consensus raft`.
 The first node creates the cluster; each later node joins it by pointing
-`-join` at any existing member's **client** address (so the cluster can tell it
-who the leader is). Use `-insecure-plaintext` only for local development.
+`-join` at any existing member's **control** address (`-control-addr`) — the
+dedicated cluster-control endpoint where membership changes (JOIN) happen.
+The client-facing `-client-addr` endpoint only serves cache commands and never
+accepts JOIN, so a cache client cannot mutate membership. Use
+`-insecure-plaintext` only for local development.
 
 ```sh
-# node n1 — creates the cluster
+# node n1 — creates the cluster (client :8081, control :8082, raft :9101)
 cacheyd -consensus raft -node-id n1 -client-addr 127.0.0.1:8081 \
-  -raft-addr 127.0.0.1:9101 -data-dir data/n1 -bootstrap -insecure-plaintext
+  -control-addr 127.0.0.1:8082 -raft-addr 127.0.0.1:9101 \
+  -data-dir data/n1 -bootstrap -insecure-plaintext
 
-# node n2 — joins it
-cacheyd -consensus raft -node-id n2 -client-addr 127.0.0.1:8082 \
-  -raft-addr 127.0.0.1:9102 -data-dir data/n2 \
-  -join 127.0.0.1:8081 -insecure-plaintext
+# node n2 — joins through n1's CONTROL endpoint
+cacheyd -consensus raft -node-id n2 -client-addr 127.0.0.1:8083 \
+  -control-addr 127.0.0.1:8084 -raft-addr 127.0.0.1:9102 \
+  -data-dir data/n2 -join 127.0.0.1:8082 -insecure-plaintext
 ```
 
 Every node keeps its own `-data-dir` for the raft log and snapshots. Writes
@@ -192,14 +196,16 @@ works pointed at any node:
 
 ```sh
 cachey -insecure-plaintext 127.0.0.1:8081 put user alice  # may redirect to the leader
-cachey -insecure-plaintext 127.0.0.1:8082 get user        # follows the redirect
+cachey -insecure-plaintext 127.0.0.1:8083 get user        # follows the redirect
 ```
 
 Restarting a member from its existing `-data-dir` restores its membership —
 including after snapshots/log compaction, thanks to the durable committed
-configuration; pass `-join` again only to re-announce a changed client address.
-(Raft transport is plaintext today — node-to-node mTLS is not yet wired into
-cluster mode.)
+configuration; pass `-join` again only to re-announce a changed address.
+The control endpoint is the current authorization boundary; binding it to node
+identity (certificate SAN == node id) and moving JOIN onto the node-to-node
+transport is the planned mTLS step. (Raft transport is plaintext today —
+node-to-node mTLS is not yet wired into cluster mode.)
 
 <br>
 
