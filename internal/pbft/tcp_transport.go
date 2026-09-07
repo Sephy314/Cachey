@@ -3,12 +3,15 @@ package pbft
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"log"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/Sephy314/Cachey/internal/mtls"
 )
 
 // This file implements the TCP NDJSON transport for PBFT messages (M5),
@@ -71,6 +74,17 @@ type TCPTransport struct {
 	stopCh    chan struct{}
 	doneCh    chan struct{}
 	fault     func(from, to string) bool
+
+	// mTLS (see EnableTLS). When tlsOn, connections are wrapped in TLS and the
+	// Hello key exchange is trusted only from the mTLS-authenticated peer
+	// (TOFU removed). peerTLS caches one client config per peer; serverTLS is
+	// the listener config built once at Listen.
+	tlsOn     bool
+	tlsCA     []byte
+	tlsCert   []byte
+	tlsKey    []byte
+	peerTLS   map[string]*tls.Config
+	serverTLS *tls.Config
 }
 
 // peerConn is one outbound connection to a peer.
@@ -159,6 +173,14 @@ func (t *TCPTransport) Listen(addr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if t.tlsEnabled() {
+		cfg, err := t.serverTLSConfig()
+		if err != nil {
+			ln.Close()
+			return "", err
+		}
+		ln = tls.NewListener(ln, cfg)
+	}
 	t.ln = ln
 	go t.acceptLoop()
 	return ln.Addr().String(), nil
@@ -172,6 +194,86 @@ func (t *TCPTransport) Addr() string {
 		return ""
 	}
 	return t.ln.Addr().String()
+}
+
+// EnableTLS turns on mutual TLS for every PBFT message. This replica
+// identifies itself with certPEM/keyPEM (whose DNS SAN must be this replica's
+// id, see internal/mtls) and requires every peer to present a certificate
+// signed by caPEM whose DNS SAN is a known replica id. It must be called
+// before Listen. Plaintext stays the default (tests and local development).
+func (t *TCPTransport) EnableTLS(caPEM, certPEM, keyPEM []byte) {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	t.tlsOn = true
+	t.tlsCA = caPEM
+	t.tlsCert = certPEM
+	t.tlsKey = keyPEM
+	t.peerTLS = make(map[string]*tls.Config)
+}
+
+func (t *TCPTransport) tlsEnabled() bool {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	return t.tlsOn
+}
+
+// serverTLSConfig builds (once) the listener's *tls.Config, whose accept
+// predicate admits only certificates of known replicas (self or a configured
+// peer). The predicate reads the live peer map, so members added via
+// RegisterPeer are admitted without rebuilding the config.
+func (t *TCPTransport) serverTLSConfig() (*tls.Config, error) {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	if t.serverTLS != nil {
+		return t.serverTLS, nil
+	}
+	cfg, err := mtls.Server(t.tlsCA, t.tlsCert, t.tlsKey, t.acceptPeer)
+	if err != nil {
+		return nil, err
+	}
+	t.serverTLS = cfg
+	return cfg, nil
+}
+
+// acceptPeer reports whether an inbound certificate's identity (its DNS SAN)
+// belongs to a known replica: this replica or a configured peer.
+func (t *TCPTransport) acceptPeer(identity string) bool {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	if t.node != nil && identity == t.node.id {
+		return true
+	}
+	_, known := t.peerAddrs[identity]
+	return known
+}
+
+// peerTLSConfig returns the cached client *tls.Config for dialing peer,
+// pinning the peer's expected identity (its replica id) via ServerName.
+func (t *TCPTransport) peerTLSConfig(peer string) (*tls.Config, error) {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	if c, ok := t.peerTLS[peer]; ok {
+		return c, nil
+	}
+	cfg, err := mtls.Client(t.tlsCA, t.tlsCert, t.tlsKey, peer)
+	if err != nil {
+		return nil, err
+	}
+	t.peerTLS[peer] = cfg
+	return cfg, nil
+}
+
+// dialPeer dials peer at addr, wrapping the connection in TLS when enabled:
+// the peer must present a certificate signed by our CA whose DNS SAN is peer.
+func (t *TCPTransport) dialPeer(addr, peer string) (net.Conn, error) {
+	if !t.tlsEnabled() {
+		return net.DialTimeout("tcp", addr, tcpWriteTimeout)
+	}
+	cfg, err := t.peerTLSConfig(peer)
+	if err != nil {
+		return nil, err
+	}
+	return mtls.Dial("tcp", addr, cfg, tcpWriteTimeout)
 }
 
 func (t *TCPTransport) acceptLoop() {
@@ -238,6 +340,12 @@ func (t *TCPTransport) exchangeHello(conn net.Conn, rd *bufio.Reader, pc *peerCo
 		return "", false // a peer must introduce itself first
 	}
 	if err := json.Unmarshal(wm.Data, &h); err != nil {
+		return "", false
+	}
+	// With mTLS the connection's peer is authenticated by certificate, so the
+	// Hello may only introduce that same peer — an impostor's Hello (TOFU) no
+	// longer works. Plaintext keeps the legacy behavior for tests/dev.
+	if t.tlsEnabled() && mtls.PeerIdentity(conn) != h.ID {
 		return "", false
 	}
 	node.SetPeerKey(h.ID, h.Pub)
@@ -344,7 +452,7 @@ func (t *TCPTransport) peerConn(peer string) (*peerConn, error) {
 	if pc.conn != nil {
 		return pc, nil
 	}
-	conn, err := net.DialTimeout("tcp", pc.addr, tcpWriteTimeout)
+	conn, err := t.dialPeer(pc.addr, peer)
 	if err != nil {
 		return nil, err
 	}

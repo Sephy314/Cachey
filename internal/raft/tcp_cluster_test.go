@@ -8,6 +8,12 @@ import (
 // startTCPCluster starts a real multi-node cluster communicating over TCP with
 // newline-delimited JSON framing.
 func startTCPCluster(t *testing.T, ids []string, opts clusterOpts) (map[string]*Node, map[string]*fsm, map[string]*TCPTransport) {
+	return startTCPClusterWith(t, ids, opts, nil)
+}
+
+// startTCPClusterWith is startTCPCluster plus an optional per-transport setup
+// hook (used by the mTLS test to EnableTLS before binding listeners).
+func startTCPClusterWith(t *testing.T, ids []string, opts clusterOpts, setup func(id string, tr *TCPTransport)) (map[string]*Node, map[string]*fsm, map[string]*TCPTransport) {
 	t.Helper()
 	if opts.heartbeat == 0 {
 		opts.heartbeat = 20 * time.Millisecond
@@ -19,6 +25,9 @@ func startTCPCluster(t *testing.T, ids []string, opts clusterOpts) (map[string]*
 	transports := make(map[string]*TCPTransport)
 	for _, id := range ids {
 		transports[id] = NewTCPTransport(nil)
+		if setup != nil {
+			setup(id, transports[id])
+		}
 	}
 	// Bind all listeners first so we know every peer's address.
 	addrs := make(map[string]string)

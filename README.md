@@ -71,6 +71,15 @@ machines.
 - End-to-end cluster tests: replication, failover, restart recovery, add/remove
   membership, stale-node election loss, network partitions, snapshot restore
 
+**Security — mutual TLS** (`internal/mtls`)
+- Client ↔ server mTLS: the cache server requires a client certificate signed
+  by a trusted CA and admits only allowlisted identities
+- Node ↔ node mTLS on both the Raft and PBFT transports; each dialer pins the
+  peer's certificate identity (its DNS SAN) to the expected node id
+- Identity is carried in the certificate SAN, never CN; standard chain +
+  hostname verification is always on (no `InsecureSkipVerify`)
+- `cacheyd` defaults to TLS — plaintext requires the explicit
+  `--insecure-plaintext` development flag
 **PBFT consensus engine** (`internal/pbft`)
 - Normal-case consensus — pre-prepare / prepare / commit with total order
 - Byzantine fault tolerance — tolerates `f` faulty replicas (`N >= 3f + 1`)
@@ -102,9 +111,25 @@ no need to clone the repository.
 
 **1. Start a Cachey server**
 
+`cacheyd` defaults to mutual TLS, so a local run without certificates uses
+the explicit development flag:
+
 ```sh
-cacheyd :8080
+cacheyd --insecure-plaintext :8080
 ```
+
+With mutual TLS — the default posture; a bare `cacheyd <address>` refuses to
+start without TLS flags:
+
+```sh
+cacheyd --tls-ca ca.pem --tls-cert server.pem --tls-key server-key.pem \
+  --allow-client alice :8080
+```
+
+`--allow-client` names an identity (the certificate's DNS SAN) a client may
+present; repeat the flag to admit more clients. Certificates must be issued so
+their DNS SAN carries the identity (see `internal/mtls/testca` for a test-only
+CA helper).
 
 **2. Connect with a client**
 

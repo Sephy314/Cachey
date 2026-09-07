@@ -10,6 +10,12 @@ import (
 // the key handshake (no out-of-band key wiring), returning replicas, fsms and
 // transports. view-0 primary is the lexicographically first id.
 func startTCPCluster(t *testing.T, ids []string) (map[string]*Replica, map[string]*fsm, map[string]*TCPTransport) {
+	return startTCPClusterWith(t, ids, nil)
+}
+
+// startTCPClusterWith is startTCPCluster plus an optional per-transport setup
+// hook (used by the mTLS test to EnableTLS before binding listeners).
+func startTCPClusterWith(t *testing.T, ids []string, setup func(id string, tr *TCPTransport)) (map[string]*Replica, map[string]*fsm, map[string]*TCPTransport) {
 	t.Helper()
 	peersOf := func(id string) []string {
 		var out []string
@@ -25,6 +31,9 @@ func startTCPCluster(t *testing.T, ids []string) (map[string]*Replica, map[strin
 	transports := make(map[string]*TCPTransport)
 	for _, id := range ids {
 		tr := NewTCPTransport(nil)
+		if setup != nil {
+			setup(id, tr)
+		}
 		f := &fsm{}
 		r, err := NewReplica(Config{ID: id, Peers: peersOf(id)}, tr, f.apply)
 		if err != nil {
