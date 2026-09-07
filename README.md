@@ -70,8 +70,11 @@ sharded across machines).
 - Leader redirect — clients are told where the current leader is
 - Dynamic membership — add/remove voting members (single-server changes)
 - Log compaction + `InstallSnapshot` catch-up for joining and restarting nodes
-- End-to-end cluster tests: replication, failover, restart recovery, add/remove
-  membership, stale-node election loss, network partitions, snapshot restore
+- Durable committed membership (`raft.meta`) — a node that restarts even after
+  its log was compacted rejoins as a full member with its peers' addresses
+- End-to-end cluster tests: replication, failover, restart recovery, membership
+  add/restart/leader-change, snapshot + restart + join, follower and leader
+  network partitions with heal
 - Runnable cluster mode — `cacheyd -consensus raft` forms a multi-node
   replicated cluster (bootstrap + join, see Quick Start)
 
@@ -192,9 +195,11 @@ cachey -insecure-plaintext 127.0.0.1:8081 put user alice  # may redirect to the 
 cachey -insecure-plaintext 127.0.0.1:8082 get user        # follows the redirect
 ```
 
-Restarting a member from its existing `-data-dir` restores its membership;
-pass `-join` again to re-announce a changed client address. (Raft transport is
-plaintext today — node-to-node mTLS is not yet wired into cluster mode.)
+Restarting a member from its existing `-data-dir` restores its membership —
+including after snapshots/log compaction, thanks to the durable committed
+configuration; pass `-join` again only to re-announce a changed client address.
+(Raft transport is plaintext today — node-to-node mTLS is not yet wired into
+cluster mode.)
 
 <br>
 
