@@ -1,6 +1,7 @@
 package hotstuff
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
@@ -18,12 +19,14 @@ import (
 // verify it (no threshold-signature scheme needed — signatures are stored
 // individually, HS-later optimization).
 //
-// Key distribution is a trusted bootstrap step (SetPeerKey), mirroring PBFT's
-// dynamic key exchange whose first hop is trusted. In the in-memory milestone
-// the test harness wires every peer's public key before any message flows; a
-// TCP transport (a later milestone) will carry the exchange on connect. The
-// upgrade path is pinning keys in the cluster config or running the transport
-// over mTLS.
+// Key distribution is a trusted bootstrap step (SetPeerKey). A key is PINNED
+// once and never silently replaced: a peer's claimed public key can only be
+// registered if none is pinned yet (or the same key is offered again), so a
+// later impostor claiming the same member id cannot take over. In-memory tests
+// wire deterministic phantom keys; a persistent node reloads its own identity
+// and its peers' pins from disk before any traffic (see server.OpenHotStuffNode
+// and the HS-M3/HM5 notes). The production upgrade path is pinning keys in the
+// cluster config or running the transport over mTLS.
 
 // canonicalSignable returns a deterministic JSON encoding of m with the "sig"
 // field removed, so a signature covers everything that matters without
@@ -74,13 +77,43 @@ func (n *Replica) PublicKey() ed25519.PublicKey {
 	return n.pub
 }
 
-// SetPeerKey registers the identity public key of a peer (the trusted key
-// bootstrap / dynamic key exchange of HS-M3). A replica rejects any signed
-// message whose sender's key is not registered (mirrors pbft.Replica.SetPeerKey).
-func (n *Replica) SetPeerKey(peer string, pub ed25519.PublicKey) {
+// SetPeerKey pins the identity public key of peer. Pinning is one-way: once a
+// key is pinned for a member, a DIFFERENT key for that member is refused
+// (returns false) — whoever pinned first cannot be impersonated by a later
+// claim. Re-pinning the SAME key (a reconnect) is a no-op success. Unknown
+// members may still register (the membership check lives in the transport /
+// caller).
+func (n *Replica) SetPeerKey(peer string, pub ed25519.PublicKey) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if len(pub) == 0 {
+		return false
+	}
+	if old, ok := n.peerKeys[peer]; ok && len(old) > 0 && !bytes.Equal(old, pub) {
+		return false // a different key is already pinned for this member
+	}
 	n.peerKeys[peer] = pub
+	return true
+}
+
+// PeerKey returns the pinned identity public key of peer, if any.
+func (n *Replica) PeerKey(peer string) (ed25519.PublicKey, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	pub, ok := n.peerKeys[peer]
+	return pub, ok
+}
+
+// PeerKeys returns a snapshot of every pinned peer public key (for a persistent
+// node to write its pins to disk so a restart re-pins before any traffic).
+func (n *Replica) PeerKeys() map[string]ed25519.PublicKey {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := make(map[string]ed25519.PublicKey, len(n.peerKeys))
+	for id, pub := range n.peerKeys {
+		out[id] = pub
+	}
+	return out
 }
 
 // sign returns this replica's signature over m (see signPayload).
@@ -107,7 +140,12 @@ func (n *Replica) qcValid(qc *QC) bool {
 		return false
 	}
 	if qc.NodeID == genesisID {
-		return true // hard-coded genesis QC is the trusted root
+		// Only the actual genesis root — the QC over genesis at height 0 — is
+		// trusted. A forged "genesis QC" claiming a higher height (or any votes
+		// that would certify something else) must not pass: an attacker could
+		// otherwise bootstrap a block with an absurd justification height and
+		// corrupt the replica's height bookkeeping.
+		return qc.Height == 0
 	}
 	if len(qc.Votes) < 2*n.f+1 {
 		return false

@@ -1,6 +1,6 @@
 // Package mtls implements Cachey's mutual-TLS (mTLS) transport authentication:
 // cache clients authenticate to a cache server, and consensus nodes
-// (Raft/PBFT) authenticate to one another.
+// (Raft) authenticate to one another.
 //
 // Identity model. A principal's identity is its certificate's DNS
 // subjectAltName (SAN) — never CN, which X.509 has deprecated for identity. A

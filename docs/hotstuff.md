@@ -1,11 +1,33 @@
 # PBFT → Chained HotStuff 전환 기획서
 
-> 상태: **v4 — HS-M1·HS-M2·HS-M3 구현 완료** (`internal/hotstuff/`, race 클린).
-> HS-M4(WAL 영속화 & 복구) 대기.
+> 상태: **v6 — HS-M1~HS-M5 구현 완료** (`internal/hotstuff/` + `internal/server` 라이브러리
+> 통합, race 클린, PBFT 삭제). `cacheyd -consensus hotstuff` wiring(실행 제품 연결)은
+> 후순위 — M5는 "코어 통합"까지가 완료 범위.
 > 기준: Yin, Malkhi, Reiter, Golan-Gueta, Abraham, *"HotStuff: BFT Consensus with
 > Linearity and Responsiveness"* (PODC '19), arXiv:1803.05069. 체인 규칙/커밋·락
 > 규칙/투표 규칙은 위 논문 §5(Chained), §6(Event-driven Implementation, Alg. 4/6),
 > Appendix B(구현 의사코드 안전성 증명) 기준으로 고정한다.
+>
+> v6.1 보안 리뷰 반영 (두 차례 리뷰의 P0/P1/P2 모두 처리):
+> - **뷰 점프 쿼럼 게이트**: 단일 vc/제안으로 미래 뷰로 점프 금지 — `maybeActivateLocked`가
+>   2f+1 vc 확인 후에만 `enterViewLocked` (HandleViewChange에서 선점프 제거).
+> - **투표 높이 검증**: `voteForBlockLocked`가 `v.Height == 블록.Height` 강제 — 잘못된
+>   높이의 정상 서명 투표가 vote set을 오염/영구 wedge하는 것 차단.
+> - **genesis QC 신뢰 강화**: `qcValid`가 genesis QC를 `NodeID==genesis && Height==0`일 때만
+>   신뢰 — 위조 "genesis QC" 높이 팽창 거부.
+> - **투표 durable 게이트**: pkVoted 영속화 실패 시 투표를 보내지 않음(재시작 후 같은 높이
+>   재투표로 QC 유일성 붕괴 방지). block/qc/watermark는 best-effort 유지.
+> - **FSM 영속 복구(P0)**: `server.OpenHotStuffNode` — store FSM과 엔진이 한 WAL 공유,
+>   영속 applyFn이 커밋된 각 mutation을 store record(OpPut 등)로 WAL에 별도 기록 →
+>   재시작 시 FSM을 그 record들로 재구성(엔진은 watermark 아래 재실행 안 함). 재시작 테스트
+>   `TestHotStuffPersistentRestart`로 데이터 생존 검증.
+> - **신원/키 핀 영속(P0)**: 노드 개인키를 디스크에 영속(`hsidentity.json`, `Config.PrivateKey`
+>   주입) — 재시작 후에도 공개키 안정, 과거 QC 서명 검증 유지. peer 키는 1회 핀 고정 후
+>   교체 거부(`SetPeerKey`), Hello는 설정된 멤버만 + 기존 핀과 다른 키면 연결 거부, 핀은
+>   `hspeers.json`에 영속. (첫 부팅 TOFU 창은 여전 — 프로덕션은 mTLS 권장.)
+> - **transport Close**: `stopCh` 닫고 accept loop가 `net.ErrClosed`로 종료(busy-loop 방지).
+> - **store flush 보정**: Chained HotStuff는 팔로워가 리더보다 한 블록 늦게 커밋 → 스토어
+>   `propose()`가 리더 커밋 후 빈 블록 하나를 추가 flush해 팔로워가 최종 QC를 접도록 함.
 >
 > v2 변경: (1) commit rule을 §4.2/4.3에서 정밀 고정(부모/justify 기반 판정,
 > 작업 예시 포함). (2) HS-M1에 인증/암호 미포함 명시 + 안전/활성 테스트 분리.
@@ -273,17 +295,43 @@ Non-validator ⇒ cannot contribute to quorum
     (c) `HandleProposal`이 락 밖에서 `n.leader`를 읽어 타이머 뷰체인지와 데이터
     레이스 → 락 안에서 캡처; (d) `TestViewTimeoutFires` 20ms 기본 타이머가 서명
     비용(+race) 타이밍 경쟁으로 새 리더를 제안 전 축출 → 150ms로 상향(의도 보존).
-- **HS-M4 — WAL 영속화 & 복구**: 수용한 블록·QC·실행 watermark 영속화, 리스타트 시
-  트리/watermark 복구, watermark 아래 재실행 금지(멱등 복구). `wal_persist_test.go`
-  스타일 크래시-재시작 테스트.
-- **HS-M5 — 서버 통합 & PBFT 삭제**: `internal/server/hotstuff_cluster.go`
-  (HotStuffClusterStore + persistent node 빌더, raftnode.go와 대칭),
-  `pbft_cluster_test.go`의 대체 클러스터 테스트(TCP, 실제 store FSM). 성공 후
-  `internal/pbft` 및 `pbft_cluster.go` 삭제 + 참조/문서 정리. 이 시점 전체 트리 초록.
-
-**이번 범위**: HS-M1 ~ HS-M5. **별도 단계(후순위)**: `cacheyd -consensus hotstuff`
-wiring(bootstrap/join), 커맨드 배칭, threshold signature QC, 체크포인트/상태 전송,
-동적 멤버십.
+- **HS-M4 — WAL 영속화 & 복구 — 구현 완료**: 수용한 블록(pkBlock, Justify QC 동봉)
+  · qcHigh 상승(pkQC — 리더의 투표 집계 QC는 어떤 블록에도 박혀 있지 않으므로 별도
+  기록) · 실행 watermark(pkApplied — `commitUpToLocked` 후 bExec id) · 투표 높이
+  (pkVoted — vHeight 상승 시; 크래시 후 재투표 방지 = QC 유일성)를 `wal.OpHotStuff`
+  레코드로 동기 영속화. 리스타트 시 WAL replay로 트리/watermark/vHeight 복구 후
+  `FinishRecovery()`가 복구된 QC를 구조적 원칙(서명 재검증 없이 — 영속 QC는 수용 시
+  검증됨)으로 재생해 qcHigh/head(=최고 QC 증명 블록)/lock/exec을 재계산하고
+  watermark 이하 체인을 applied로 표시 → applyFn 재실행 없음(멱등 복구).
+  - 파일: `persist.go`(신규: `LogStore`/`NewWALLogStore`/`ApplyRecoveredRecord`/
+    `FinishRecovery`), `node.go`(proposeLocked/addBlockLocked/onNewQCLocked/
+    handleProposalLocked/commitUpToLocked 영속 훅), `internal/wal`(`OpHotStuff` op +
+    recovery 허용 목록), `wal_persist_test.go`(신규).
+  - 테스트: `TestWALPersistenceRestart`(단일 노드 커밋 → 재시작 → 재실행 없음 +
+    계속 커밋), `TestWALRecoveryRebuildsTree`(미커밋 수용 블록/QC 복구 후 커밋),
+    `TestWALVoteHeightSurvivesRestart`(팔로워 투표 높이 복구 → 재투표 방지 + 상위
+    투표 재개), `TestWALRecoveryIgnoresForeignOps`(비핫스터프 레코드 무시).
+  - ponytail 한계: (a) watermark 등 영속화는 best-effort(실패 시 로그, 핸들러 중단
+    없음) — PBFT M4와 동일, 이후 크래시 시 마지막 스팬 재실행 가능(운영 배포는
+    실패 치명화/재시도 필요). (b) WAL 무제한 성장(엔진 수준 스냅샷 없음, `DisableRotation`
+    로그 모드) — 압축은 후순위. (c) 리더의 vote-집계 QC가 영속화되지만, fetch 중
+    베이스 QC처럼 certified 블록이 미도착인 순간의 크래시는 해당 QC를 잃을 수 있음
+    (재참여로 복구, 안전성 무관).
+- **HS-M5 — 서버 통합 & PBFT 삭제 — 구현 완료**: `internal/hotstuff/tcp_transport.go`
+  (NDJSON TCP, 연결마다 Hello로 신원 Ed25519 공개키 교환(TOFU) + `ConnectPeers`
+  full-mesh 키 교환), `internal/server/hotstuff_cluster.go`(`HotStuffClusterStore`
+  — 리더만 쓰기, 리더가 커맨드 블록 위 빈 블록을 flush해 3-chain 커밋 유도;
+  `NewHotStuffApply`), `internal/server/hotstuff_cluster_test.go`(4-노드 TCP
+  클러스터: 쓰기/읽기 수렴, 팔로워 `ErrNotLeader` 거부, 리더 힌트, DEL).
+  `internal/pbft` 전체 + `server/pbft_cluster.go`/`_test.go` 삭제, `wal`에서
+  `OpPBFT` 제거(store는 `OpHotStuff`를 no-op으로), `cmd/cacheyd`/`README.md`/`mtls`
+  참조 정리. `cacheyd -consensus hotstuff` wiring은 후순위(고정 멤버 정적 피어 리스트).
+  - 잡은 것: HotStuff 메시지 패턴(제안 리더→전체, 투표 전체→리더)은 팔로워끼리
+    절대 연결하지 않아 TOFU 키 교환만으론 팔로워가 QC(2f+1 멤버 투표)를 검증할 수
+    없음 → 시작 시 `ConnectPeers`로 전 메시지 mesh 키 교환 필요(pbft는 broadcast라
+    자연 full-mesh).
+- **HS-M5 이후(후순위)**: `cacheyd -consensus hotstuff` wiring(정적 피어 리스트),
+  커맨드 배칭, threshold signature QC, 체크포인트/상태 전송, 동적 멤버십.
 
 ## 7. ponytail 한계 (명시적 트레이드오프)
 

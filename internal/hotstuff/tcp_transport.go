@@ -1,38 +1,37 @@
-package pbft
+package hotstuff
 
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"log"
-	"net"
+	gonet "net"
 	"sync"
 	"time"
-
-	"github.com/Sephy314/Cachey/internal/mtls"
 )
 
-// This file implements the TCP NDJSON transport for PBFT messages (M5),
-// mirroring Raft's tcp_transport.go. Unlike Raft's request/reply RPCs, PBFT
-// messages are one-way multicasts: the transport writes each message to a
-// peer's persistent connection and never waits for a reply.
+// This file implements the TCP NDJSON transport for HotStuff messages (HS-M5),
+// mirroring Raft/PBFT's tcp_transport.go. Unlike Raft's request/reply RPCs,
+// HotStuff messages are one-way: the transport writes each message to a peer's
+// persistent outbound connection and never waits for a reply.
 //
-// Key exchange (M3) happens on every (re)connection: each side first sends a
+// Key exchange (HS-M3) happens on every (re)connection: each side first sends a
 // Hello carrying its identity public key, and the peer registers it (trust on
-// first use) so message signatures can be verified.
+// first use) so message signatures can be verified. mTLS (pinning keys to
+// certificate identities) is the documented upgrade path, out of scope here.
 
-// tcpWriteTimeout bounds a single outbound message write.
+// tcpWriteTimeout bounds a single outbound message write and a dial.
 const tcpWriteTimeout = 5 * time.Second
 
 // Wire message kinds.
 const (
-	kindPrePrepare = "PrePrepare"
-	kindPrepare    = "Prepare"
-	kindCommit     = "Commit"
+	kindProposal   = "Proposal"
+	kindVote       = "Vote"
 	kindViewChange = "ViewChange"
-	kindNewView    = "NewView"
+	kindFetch      = "Fetch"
+	kindBlock      = "Block"
 	kindHello      = "Hello"
 )
 
@@ -44,7 +43,7 @@ type wireMsg struct {
 
 // Hello introduces a replica on a fresh connection: its id and identity public
 // key. The receiver registers the key (TOFU) so it can verify the sender's
-// message signatures.
+// message signatures (HS-M3).
 type Hello struct {
 	ID  string `json:"id"`
 	Pub []byte `json:"pub"`
@@ -63,40 +62,30 @@ func encodeMsg(kind string, v any) ([]byte, error) {
 	return append(b, '\n'), nil
 }
 
-// TCPTransport implements Transport over TCP. It keeps one persistent
-// connection per peer and reconnects automatically after failures.
+// TCPTransport implements Transport over TCP. It keeps one persistent outbound
+// connection per peer and reconnects automatically after failures. Inbound
+// connections each run a read loop that dispatches to the local node.
 type TCPTransport struct {
 	node      *Replica
 	peerAddrs map[string]string
-	ln        net.Listener
+	ln        gonet.Listener
 	conns     map[string]*peerConn
 	connMu    sync.Mutex
 	stopCh    chan struct{}
 	doneCh    chan struct{}
+	closeOnce sync.Once
 	fault     func(from, to string) bool
-
-	// mTLS (see EnableTLS). When tlsOn, connections are wrapped in TLS and the
-	// Hello key exchange is trusted only from the mTLS-authenticated peer
-	// (TOFU removed). peerTLS caches one client config per peer; serverTLS is
-	// the listener config built once at Listen.
-	tlsOn     bool
-	tlsCA     []byte
-	tlsCert   []byte
-	tlsKey    []byte
-	peerTLS   map[string]*tls.Config
-	serverTLS *tls.Config
 }
 
 // peerConn is one outbound connection to a peer.
 type peerConn struct {
-	addr     string
-	mu       sync.Mutex
-	conn     net.Conn
-	rd       *bufio.Reader
-	helloSet bool
+	addr string
+	mu   sync.Mutex
+	conn gonet.Conn
+	rd   *bufio.Reader
 }
 
-// NewTCPTransport creates a transport for node. peerAddrs can be populated
+// NewTCPTransport creates a transport for node. Peer addresses can be populated
 // after construction via SetPeers / RegisterPeer.
 func NewTCPTransport(node *Replica) *TCPTransport {
 	return &TCPTransport{
@@ -108,7 +97,7 @@ func NewTCPTransport(node *Replica) *TCPTransport {
 	}
 }
 
-// SetPeers records the peer address map (id → host:port).
+// SetPeers records the peer address map (id -> host:port).
 func (t *TCPTransport) SetPeers(addrs map[string]string) {
 	t.connMu.Lock()
 	defer t.connMu.Unlock()
@@ -131,7 +120,9 @@ func (t *TCPTransport) SetNode(n *Replica) {
 	t.node = n
 }
 
-// Close stops accepting and drops all peer connections. Safe to call once.
+// Close stops accepting and drops all peer connections, then closes stopCh so
+// the accept loop (and anything else waiting on it) unwinds and doneCh closes.
+// Safe to call more than once.
 func (t *TCPTransport) Close() {
 	t.connMu.Lock()
 	if t.ln != nil {
@@ -147,6 +138,7 @@ func (t *TCPTransport) Close() {
 	}
 	t.conns = make(map[string]*peerConn)
 	t.connMu.Unlock()
+	t.closeOnce.Do(func() { close(t.stopCh) })
 }
 
 // SetFaultInjector installs a predicate that drops outbound messages to a
@@ -169,20 +161,12 @@ func (t *TCPTransport) partitioned(peer string) bool {
 // Listen binds the local listener and starts accepting connections. It returns
 // the bound address (useful with ":0" for tests).
 func (t *TCPTransport) Listen(addr string) (string, error) {
-	ln, err := net.Listen("tcp", addr)
+	ln, err := gonet.Listen("tcp", addr)
 	if err != nil {
 		return "", err
 	}
-	if t.tlsEnabled() {
-		cfg, err := t.serverTLSConfig()
-		if err != nil {
-			ln.Close()
-			return "", err
-		}
-		ln = tls.NewListener(ln, cfg)
-	}
 	t.ln = ln
-	go t.acceptLoop()
+	go t.acceptLoop(ln)
 	return ln.Addr().String(), nil
 }
 
@@ -196,91 +180,16 @@ func (t *TCPTransport) Addr() string {
 	return t.ln.Addr().String()
 }
 
-// EnableTLS turns on mutual TLS for every PBFT message. This replica
-// identifies itself with certPEM/keyPEM (whose DNS SAN must be this replica's
-// id, see internal/mtls) and requires every peer to present a certificate
-// signed by caPEM whose DNS SAN is a known replica id. It must be called
-// before Listen. Plaintext stays the default (tests and local development).
-func (t *TCPTransport) EnableTLS(caPEM, certPEM, keyPEM []byte) {
-	t.connMu.Lock()
-	defer t.connMu.Unlock()
-	t.tlsOn = true
-	t.tlsCA = caPEM
-	t.tlsCert = certPEM
-	t.tlsKey = keyPEM
-	t.peerTLS = make(map[string]*tls.Config)
-}
-
-func (t *TCPTransport) tlsEnabled() bool {
-	t.connMu.Lock()
-	defer t.connMu.Unlock()
-	return t.tlsOn
-}
-
-// serverTLSConfig builds (once) the listener's *tls.Config, whose accept
-// predicate admits only certificates of known replicas (self or a configured
-// peer). The predicate reads the live peer map, so members added via
-// RegisterPeer are admitted without rebuilding the config.
-func (t *TCPTransport) serverTLSConfig() (*tls.Config, error) {
-	t.connMu.Lock()
-	defer t.connMu.Unlock()
-	if t.serverTLS != nil {
-		return t.serverTLS, nil
-	}
-	cfg, err := mtls.Server(t.tlsCA, t.tlsCert, t.tlsKey, t.acceptPeer)
-	if err != nil {
-		return nil, err
-	}
-	t.serverTLS = cfg
-	return cfg, nil
-}
-
-// acceptPeer reports whether an inbound certificate's identity (its DNS SAN)
-// belongs to a known replica: this replica or a configured peer.
-func (t *TCPTransport) acceptPeer(identity string) bool {
-	t.connMu.Lock()
-	defer t.connMu.Unlock()
-	if t.node != nil && identity == t.node.id {
-		return true
-	}
-	_, known := t.peerAddrs[identity]
-	return known
-}
-
-// peerTLSConfig returns the cached client *tls.Config for dialing peer,
-// pinning the peer's expected identity (its replica id) via ServerName.
-func (t *TCPTransport) peerTLSConfig(peer string) (*tls.Config, error) {
-	t.connMu.Lock()
-	defer t.connMu.Unlock()
-	if c, ok := t.peerTLS[peer]; ok {
-		return c, nil
-	}
-	cfg, err := mtls.Client(t.tlsCA, t.tlsCert, t.tlsKey, peer)
-	if err != nil {
-		return nil, err
-	}
-	t.peerTLS[peer] = cfg
-	return cfg, nil
-}
-
-// dialPeer dials peer at addr, wrapping the connection in TLS when enabled:
-// the peer must present a certificate signed by our CA whose DNS SAN is peer.
-func (t *TCPTransport) dialPeer(addr, peer string) (net.Conn, error) {
-	if !t.tlsEnabled() {
-		return net.DialTimeout("tcp", addr, tcpWriteTimeout)
-	}
-	cfg, err := t.peerTLSConfig(peer)
-	if err != nil {
-		return nil, err
-	}
-	return mtls.Dial("tcp", addr, cfg, tcpWriteTimeout)
-}
-
-func (t *TCPTransport) acceptLoop() {
+func (t *TCPTransport) acceptLoop(ln gonet.Listener) {
 	defer close(t.doneCh)
 	for {
-		conn, err := t.ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
+			// Exiting on either the listener being closed (Close) or stopCh
+			// being closed — otherwise a closed listener spins on Accept errors.
+			if errors.Is(err, gonet.ErrClosed) {
+				return
+			}
 			select {
 			case <-t.stopCh:
 				return
@@ -294,10 +203,10 @@ func (t *TCPTransport) acceptLoop() {
 
 // handleConn runs an inbound connection: read the peer's Hello (register its
 // key), then dispatch every following message to the local node.
-func (t *TCPTransport) handleConn(conn net.Conn) {
+func (t *TCPTransport) handleConn(conn gonet.Conn) {
 	defer conn.Close()
 	rd := bufio.NewReader(conn)
-	peer, ok := t.exchangeHello(conn, rd, nil)
+	peer, ok := t.exchangeHello(conn, rd)
 	if !ok {
 		return
 	}
@@ -307,19 +216,31 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 			return
 		}
 		if err := t.dispatch(peer, line); err != nil {
-			log.Printf("pbft transport: dispatch from %s: %v", peer, err)
+			log.Printf("hotstuff transport: dispatch from %s: %v", peer, err)
 			return
 		}
 	}
 }
 
-// exchangeHello sends our Hello on conn and reads the peer's, registering its
-// key. It returns the peer's id. peerConn (outbound) may be nil on inbound.
-func (t *TCPTransport) exchangeHello(conn net.Conn, rd *bufio.Reader, pc *peerConn) (string, bool) {
+// exchangeHello sends our Hello on conn and reads the peer's, pinning its key.
+// It returns the peer's id. Two rules keep the Hello from being an identity
+// attack (HS-M5):
+//
+//   - membership: only a Hello from a CONFIGURED peer (one whose address we
+//     know) is accepted — an arbitrary dialer cannot claim to be someone we
+//     are not expecting;
+//   - pinning: the claimed public key is registered only if none is pinned yet
+//     for that id (or the same key is offered again). A Hello offering a
+//     DIFFERENT key for an already-pinned member is an impostor and the
+//     connection is dropped, so a live peer's key can never be overwritten.
+func (t *TCPTransport) exchangeHello(conn gonet.Conn, rd *bufio.Reader) (string, bool) {
 	t.connMu.Lock()
 	node := t.node
-	myHello := Hello{ID: node.id, Pub: node.PublicKey()}
 	t.connMu.Unlock()
+	if node == nil {
+		return "", false
+	}
+	myHello := Hello{ID: node.id, Pub: node.PublicKey()}
 	hb, err := encodeMsg(kindHello, myHello)
 	if err != nil {
 		return "", false
@@ -342,13 +263,15 @@ func (t *TCPTransport) exchangeHello(conn net.Conn, rd *bufio.Reader, pc *peerCo
 	if err := json.Unmarshal(wm.Data, &h); err != nil {
 		return "", false
 	}
-	// With mTLS the connection's peer is authenticated by certificate, so the
-	// Hello may only introduce that same peer — an impostor's Hello (TOFU) no
-	// longer works. Plaintext keeps the legacy behavior for tests/dev.
-	if t.tlsEnabled() && mtls.PeerIdentity(conn) != h.ID {
-		return "", false
+	t.connMu.Lock()
+	_, known := t.peerAddrs[h.ID]
+	t.connMu.Unlock()
+	if !known {
+		return "", false // not a configured peer — do not pin an impostor
 	}
-	node.SetPeerKey(h.ID, h.Pub)
+	if !node.SetPeerKey(h.ID, ed25519.PublicKey(h.Pub)) {
+		return "", false // a different key is already pinned: impostor, drop
+	}
 	return h.ID, true
 }
 
@@ -362,41 +285,41 @@ func (t *TCPTransport) dispatch(peer string, line []byte) error {
 	node := t.node
 	t.connMu.Unlock()
 	if node == nil {
-		return errors.New("pbft transport: no node")
+		return errors.New("hotstuff transport: no node")
 	}
 	switch wm.Kind {
-	case kindPrePrepare:
-		var m PrePrepare
+	case kindProposal:
+		var m Proposal
 		if err := json.Unmarshal(wm.Data, &m); err != nil {
 			return err
 		}
-		node.HandlePrePrepare(&m)
-	case kindPrepare:
-		var m Prepare
+		node.HandleProposal(&m)
+	case kindVote:
+		var m Vote
 		if err := json.Unmarshal(wm.Data, &m); err != nil {
 			return err
 		}
-		node.HandlePrepare(&m)
-	case kindCommit:
-		var m Commit
-		if err := json.Unmarshal(wm.Data, &m); err != nil {
-			return err
-		}
-		node.HandleCommit(&m)
+		node.HandleVote(&m)
 	case kindViewChange:
 		var m ViewChange
 		if err := json.Unmarshal(wm.Data, &m); err != nil {
 			return err
 		}
 		node.HandleViewChange(&m)
-	case kindNewView:
-		var m NewView
+	case kindFetch:
+		var m Fetch
 		if err := json.Unmarshal(wm.Data, &m); err != nil {
 			return err
 		}
-		node.HandleNewView(&m)
+		node.HandleFetch(&m)
+	case kindBlock:
+		var m BlockMsg
+		if err := json.Unmarshal(wm.Data, &m); err != nil {
+			return err
+		}
+		node.HandleBlock(&m)
 	default:
-		return errors.New("pbft transport: unknown kind " + wm.Kind)
+		return errors.New("hotstuff transport: unknown kind " + wm.Kind)
 	}
 	return nil
 }
@@ -404,7 +327,7 @@ func (t *TCPTransport) dispatch(peer string, line []byte) error {
 // send writes a message to peer, dialing and introducing ourselves first.
 func (t *TCPTransport) send(peer string, kind string, v any) error {
 	if t.partitioned(peer) {
-		return errors.New("pbft transport: partitioned")
+		return errors.New("hotstuff transport: partitioned")
 	}
 	pc, err := t.peerConn(peer)
 	if err != nil {
@@ -413,9 +336,8 @@ func (t *TCPTransport) send(peer string, kind string, v any) error {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	if pc.conn == nil {
-		pc.mu.Unlock()
 		t.forget(peer)
-		return errors.New("pbft transport: no connection")
+		return errors.New("hotstuff transport: no connection")
 	}
 	b, err := encodeMsg(kind, v)
 	if err != nil {
@@ -430,6 +352,33 @@ func (t *TCPTransport) send(peer string, kind string, v any) error {
 		return err
 	}
 	return nil
+}
+
+// ConnectPeers dials every configured peer and completes the Hello key
+// handshake, so this node holds every member's identity key before traffic
+// flows. HotStuff's message pattern (proposals leader→all, votes all→leader)
+// never otherwise connects followers to each other, yet a follower must verify
+// QCs carrying any 2f+1 members' votes — so identity keys must be exchanged up
+// front across the whole mesh. Best-effort: peers that are not up yet are
+// retried until deadline.
+func (t *TCPTransport) ConnectPeers(deadline time.Time) {
+	t.connMu.Lock()
+	peers := make([]string, 0, len(t.peerAddrs))
+	for p := range t.peerAddrs {
+		peers = append(peers, p)
+	}
+	t.connMu.Unlock()
+	for _, p := range peers {
+		for {
+			if _, err := t.peerConn(p); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 }
 
 // peerConn returns (and lazily dials) the connection to peer. The dial
@@ -452,14 +401,14 @@ func (t *TCPTransport) peerConn(peer string) (*peerConn, error) {
 	if pc.conn != nil {
 		return pc, nil
 	}
-	conn, err := t.dialPeer(pc.addr, peer)
+	conn, err := gonet.DialTimeout("tcp", pc.addr, tcpWriteTimeout)
 	if err != nil {
 		return nil, err
 	}
 	rd := bufio.NewReader(conn)
-	if _, ok := t.exchangeHello(conn, rd, pc); !ok {
+	if _, ok := t.exchangeHello(conn, rd); !ok {
 		conn.Close()
-		return nil, errors.New("pbft transport: key handshake with " + peer + " failed")
+		return nil, errors.New("hotstuff transport: key handshake with " + peer + " failed")
 	}
 	pc.conn = conn
 	pc.rd = rd
@@ -483,18 +432,18 @@ func (t *TCPTransport) forget(peer string) {
 
 // ---- Transport interface ----
 
-func (t *TCPTransport) SendPrePrepare(_ context.Context, peer string, m *PrePrepare) error {
-	return t.send(peer, kindPrePrepare, m)
+func (t *TCPTransport) SendProposal(_ context.Context, peer string, m *Proposal) error {
+	return t.send(peer, kindProposal, m)
 }
-func (t *TCPTransport) SendPrepare(_ context.Context, peer string, m *Prepare) error {
-	return t.send(peer, kindPrepare, m)
-}
-func (t *TCPTransport) SendCommit(_ context.Context, peer string, m *Commit) error {
-	return t.send(peer, kindCommit, m)
+func (t *TCPTransport) SendVote(_ context.Context, peer string, m *Vote) error {
+	return t.send(peer, kindVote, m)
 }
 func (t *TCPTransport) SendViewChange(_ context.Context, peer string, m *ViewChange) error {
 	return t.send(peer, kindViewChange, m)
 }
-func (t *TCPTransport) SendNewView(_ context.Context, peer string, m *NewView) error {
-	return t.send(peer, kindNewView, m)
+func (t *TCPTransport) SendFetch(_ context.Context, peer string, m *Fetch) error {
+	return t.send(peer, kindFetch, m)
+}
+func (t *TCPTransport) SendBlock(_ context.Context, peer string, m *BlockMsg) error {
+	return t.send(peer, kindBlock, m)
 }

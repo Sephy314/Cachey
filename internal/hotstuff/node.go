@@ -30,6 +30,12 @@ type Config struct {
 	ID     string   // this replica's id (unique in the cluster)
 	Peers  []string // peer replica ids, excluding self
 	Leader string   // the single proposer (defaults to ID when empty)
+	// PrivateKey optionally supplies this replica's persistent Ed25519 identity.
+	// When nil a fresh keypair is generated (in-memory tests). A production node
+	// MUST pass a key loaded from durable storage so the public key is stable
+	// across restarts — otherwise signatures embedded in past QCs no longer
+	// verify after a restart (HS-M3).
+	PrivateKey ed25519.PrivateKey
 }
 
 // Replica is one Chained HotStuff replica running the HS-M1 normal-case core.
@@ -100,6 +106,11 @@ type Replica struct {
 	baseFrom string          // peer to fetch the base block from
 	fetches  map[string]bool // block ids with a fetch already in flight
 
+	// HS-M4 durable persistence.
+	logStore    LogStore // nil = in-memory only (tests)
+	recoverQCs  []*QC    // recovered qcHigh raises, replayed by FinishRecovery
+	recoverExec string   // recovered executed watermark (exec block id)
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 }
@@ -147,9 +158,19 @@ func NewReplica(cfg Config, tr Transport, applyFn func(Block)) (*Replica, error)
 	if applyFn == nil {
 		applyFn = func(Block) {}
 	}
-	pub, priv, err := newKeyPair()
-	if err != nil {
-		return nil, fmt.Errorf("hotstuff: key generation: %w", err)
+	var (
+		pub  ed25519.PublicKey
+		priv ed25519.PrivateKey
+	)
+	if len(cfg.PrivateKey) == 0 {
+		npub, npriv, kerr := newKeyPair()
+		if kerr != nil {
+			return nil, fmt.Errorf("hotstuff: key generation: %w", kerr)
+		}
+		pub, priv = npub, npriv
+	} else {
+		priv = cfg.PrivateKey
+		pub = priv.Public().(ed25519.PublicKey)
 	}
 	g, gq := genesisBlock(all)
 	return &Replica{
@@ -267,6 +288,7 @@ func (n *Replica) proposeLocked(cmd []byte) *Proposal {
 	}
 	n.blocks[b.ID] = b
 	n.head = b.ID
+	n.persistRecordLocked(persistEntry{Kind: pkBlock, Block: *b}) // durable before the vote leaves (M4)
 	// Self-vote: the leader is a replica too, and votes are strictly monotone
 	// in height (a replica never votes twice for one height).
 	self := &Vote{Height: h, NodeID: b.ID, Voter: n.id}
@@ -362,12 +384,15 @@ func (n *Replica) handleProposalLocked(p *Proposal) (*Vote, []*Proposal, *Fetch)
 	kids := n.addBlockLocked(b, b.Parent)
 	// Vote only at heights strictly above the last one voted for (a replica
 	// never votes twice for one height — the QC-uniqueness invariant). The
-	// vote is signed by the voter (HS-M3) so the leader can authenticate it.
+	// vote-once guard must be durable before the vote leaves this replica (see
+	// persistVotedLocked); a failed write suppresses the vote, never double-votes.
 	var vote *Vote
 	if b.Height > n.vHeight {
 		n.vHeight = b.Height
-		vote = &Vote{Height: b.Height, NodeID: b.ID, Voter: n.id}
-		vote.Sig = n.sign(vote)
+		if n.persistVotedLocked(b.Height) == nil {
+			vote = &Vote{Height: b.Height, NodeID: b.ID, Voter: n.id}
+			vote.Sig = n.sign(vote)
+		}
 	}
 	return vote, kids, nil
 }
@@ -389,6 +414,7 @@ func (n *Replica) addBlockLocked(b *Block, parentID string) []*Proposal {
 		}
 		n.blocks[cur.ID] = cur
 		delete(n.fetches, cur.ID)
+		n.persistRecordLocked(persistEntry{Kind: pkBlock, Block: *cur}) // accepted block (M4)
 		if cur.Height > n.blocks[n.head].Height {
 			n.head = cur.ID
 		}
@@ -452,8 +478,13 @@ func (n *Replica) voteForBlockLocked(v *Vote) {
 		return
 	}
 	nodeID := v.NodeID
-	if !n.members[v.Voter] || n.blocks[nodeID] == nil || !n.verify(v.Voter, v.Sig, *v) {
-		return // non-member, unknown block, or a bad signature
+	blk := n.blocks[nodeID]
+	// A vote must match its block's actual height: a Byzantine member can sign a
+	// vote for the right block at the WRONG height, and if it slipped into the
+	// vote set the QC built from those signatures would fail verification (the
+	// QC certifies the block's real height) — permanently wedging the block.
+	if blk == nil || !n.members[v.Voter] || v.Height != blk.Height || !n.verify(v.Voter, v.Sig, *v) {
+		return // non-member, unknown block, wrong height, or a bad signature
 	}
 	set := n.votes[nodeID]
 	if set == nil {
@@ -468,7 +499,7 @@ func (n *Replica) voteForBlockLocked(v *Vote) {
 		return // not yet a quorum, or the QC already formed
 	}
 	n.qcFormed[nodeID] = true
-	qc := newQC(nodeID, n.blocks[nodeID].Height)
+	qc := newQC(nodeID, blk.Height)
 	for voter, sig := range set {
 		qc.Votes[voter] = sig
 	}
@@ -487,6 +518,7 @@ func (n *Replica) onNewQCLocked(qc *QC) {
 		return // stale or duplicate; onNewQC is idempotent
 	}
 	n.qcHigh = qc
+	n.persistRecordLocked(persistEntry{Kind: pkQC, QC: qc}) // qcHigh raise (M4)
 	c := n.blocks[qc.NodeID]
 	if c == nil {
 		return // certified block not known yet; re-evaluated when it arrives
@@ -528,6 +560,7 @@ func (n *Replica) commitUpToLocked(gp *Block) {
 		n.bExec = b.ID
 		n.markAppliedLocked(b.ID)
 	}
+	n.persistRecordLocked(persistEntry{Kind: pkApplied, ExecID: n.bExec}) // executed watermark (M4)
 }
 
 func (n *Replica) markAppliedLocked(id string) {

@@ -85,8 +85,8 @@ func (n *Replica) enterViewLocked(view uint64) bool {
 
 // HandleViewChange records a peer's view change. Only the leader of the target
 // view counts them; once 2f+1 distinct members (including itself) have moved
-// to that view, it adopts the highest reported QC and becomes active. A
-// replica behind the target view joins it when a quorum has already moved.
+// to that view, it joins the view and activates, adopting the highest reported
+// QC as its base.
 func (n *Replica) HandleViewChange(vc *ViewChange) {
 	if vc == nil || !n.members[vc.From] || n.id != n.leaderOf(vc.View) {
 		return
@@ -97,9 +97,11 @@ func (n *Replica) HandleViewChange(vc *ViewChange) {
 		n.mu.Unlock()
 		return // unauthenticated/tampered, or stale
 	}
-	if n.view < vc.View {
-		n.enterViewLocked(vc.View)
-	}
+	// Count the view change, but NEVER advance to vc.View on a single (possibly
+	// Byzantine) message: a replica joins a higher view only once a quorum of
+	// 2f+1 members has moved to it (see maybeActivateLocked). Otherwise one
+	// signed ViewChange for a far-future view — whose leader this replica is —
+	// would strand it there, permanently out of reach of the real, lower views.
 	n.addVC(vc)
 	fetch = n.maybeActivateLocked(vc.View)
 	n.mu.Unlock()
@@ -124,14 +126,24 @@ func (n *Replica) addVC(vc *ViewChange) {
 
 // maybeActivateLocked activates this replica as the leader of view when it has
 // collected 2f+1 view changes for it, adopting the highest reported QC as the
-// new base. Returns a Fetch when the base block must first be pulled from a
-// peer (the leader has not seen it yet). Must hold n.mu.
+// new base. Joining the view itself is quorum-gated: a replica enters a higher
+// view only here, once a quorum has moved to it — never on a single message.
+// Returns a Fetch when the base block must first be pulled from a peer (the
+// leader has not seen it yet). Must hold n.mu.
 func (n *Replica) maybeActivateLocked(view uint64) *Fetch {
-	if n.id != n.leaderOf(view) || view != n.view {
+	if n.id != n.leaderOf(view) {
 		return nil
 	}
 	if len(n.vcs[view]) < 2*n.f+1 {
-		return nil // not a quorum yet
+		return nil // not a quorum yet — a minority can never move us to a view
+	}
+	// A quorum of members moved to view; only now is joining it safe. The
+	// caller (StartViewChange) may already have entered the view itself.
+	if view > n.view && !n.enterViewLocked(view) {
+		return nil // defensive
+	}
+	if view != n.view {
+		return nil // defensive: not (yet) in the target view
 	}
 	// The highest QC is chosen only among GENUINE QCs (a Byzantine member can
 	// sign a view change carrying a fabricated QC; qcValid filters those out).
