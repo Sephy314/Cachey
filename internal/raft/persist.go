@@ -109,6 +109,9 @@ func (n *Node) ApplyRecoveredRecord(rec wal.Record) error {
 	// tail is corrected by the live leader's LeaderCommit. Persisting the
 	// committed config separately (with term/votedFor) is the upgrade path.
 	if entry.Config != nil {
+		// Remember the most recent configuration index restored from the WAL so
+		// AdoptCommittedMeta can reject a stale durable meta file afterwards.
+		n.recoveredConfigIndex = rec.RaftIndex
 		var peers []string
 		for _, id := range entry.Config.Voters {
 			if id != n.id {

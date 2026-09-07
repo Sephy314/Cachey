@@ -87,6 +87,11 @@ type Node struct {
 	// metaStore persists the committed membership (see meta.go) so a restart
 	// after log compaction still knows the cluster.
 	metaStore MetaStore
+	// recoveredConfigIndex is the highest raft-log index of a configuration
+	// entry restored from the WAL during recovery. AdoptCommittedMeta compares
+	// against it so a stale durable meta never overwrites a newer committed
+	// configuration recovered from the log.
+	recoveredConfigIndex uint64
 
 	// pendingStepDown defers a leader's self-removal until its final heartbeat
 	// has propagated the committed configuration to the remaining members.
@@ -704,7 +709,7 @@ func (n *Node) applyCommittedLocked() {
 		e := n.log.entryAt(n.lastApplied)
 		switch {
 		case e.Config != nil:
-			n.applyConfigLocked(e.Config)
+			n.applyConfigLocked(e.Config, n.lastApplied)
 		case e.Command != nil && n.applyFn != nil:
 			n.applyFn(e)
 			n.maybeCompactLocked()
@@ -714,8 +719,9 @@ func (n *Node) applyCommittedLocked() {
 
 // applyConfigLocked adopts a committed configuration: it replaces the voter
 // set and reconciles leader bookkeeping (dropping removed servers, keeping
-// joining members that were promoted to voters).
-func (n *Node) applyConfigLocked(cfg *Configuration) {
+// joining members that were promoted to voters). idx is the raft-log index of
+// the applied configuration entry.
+func (n *Node) applyConfigLocked(cfg *Configuration, idx uint64) {
 	// Learn transport addresses of members introduced by this change so we can
 	// reach them even if we later become the leader. Without this, a member
 	// added while another node led is orphaned once leadership moves (the new
@@ -771,8 +777,10 @@ func (n *Node) applyConfigLocked(cfg *Configuration) {
 	}
 	// Persist the committed membership so a crash/restart (even after the log
 	// is compacted past these config entries) can still restore the cluster.
+	// The config's log index is recorded so recovery can tell a stale meta
+	// file from the (possibly newer) configuration recovered from the WAL.
 	if n.metaStore != nil {
-		if err := n.metaStore.Save(CommittedMeta{Voters: cfg.Voters, Addrs: cfg.Addrs}); err != nil {
+		if err := n.metaStore.Save(CommittedMeta{Voters: cfg.Voters, Addrs: cfg.Addrs, Index: idx}); err != nil {
 			n.logf("persist committed config failed: %v", err)
 		}
 	}

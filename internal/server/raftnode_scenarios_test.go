@@ -2,8 +2,11 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -242,6 +245,63 @@ func (c *raftTC) waitNodeCompacted(id string) {
 	c.wait(id+" to compact its log", 30*time.Second, func() bool {
 		return c.nodes[id].Node.LogBase() > 0
 	})
+}
+
+// TestRaftNodeStaleMetaDoesNotOverrideRecoveredConfig is a regression test for
+// the crash window between a configuration committing on a node (durable in
+// its WAL) and the raft.meta file write. If the meta file is stale, recovery
+// must keep the NEWER configuration recovered from the WAL — a stale meta must
+// never shrink the cluster back to an older membership.
+func TestRaftNodeStaleMetaDoesNotOverrideRecoveredConfig(t *testing.T) {
+	c := newRaftTC(t, 0)
+	c.add("n1")
+	c.add("n2")
+	c.add("n3") // committed config {n1,n2,n3} is in every node's WAL and raft.meta
+	c.putLeader("k1", "v1")
+	c.waitFSM("k1", "v1")
+
+	// Simulate the crash window on n2: its WAL holds the 3-voter config, but
+	// raft.meta is stale — the 2-voter config from before n3 joined.
+	n2dir := c.dirs["n2"]
+	c.nodes["n2"].Stop()
+	delete(c.nodes, "n2")
+
+	metaPath := filepath.Join(n2dir, "raft.meta")
+	raw, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read raft.meta: %v", err)
+	}
+	var meta raft.CommittedMeta
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatalf("decode raft.meta: %v", err)
+	}
+	if meta.Index == 0 {
+		t.Fatalf("raft.meta carries no config index; cannot test staleness")
+	}
+	meta.Index--
+	meta.Voters = []string{"n1", "n2"} // stale: n3's add is missing
+	meta.Addrs = nil
+	stale, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(metaPath, stale, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart n2: the WAL-recovered 3-voter config must win over the stale
+	// meta, so n2 stays a full member of {n1,n2,n3}.
+	rn := c.openDir("n2", n2dir)
+	rn.Node.Run()
+	c.waitVoters()
+	c.waitFSM("k1", "v1")
+
+	// n2 is a healthy member: after the leader dies it helps elect a
+	// replacement and keeps committing.
+	c.stop("n1")
+	c.waitLeader()
+	c.putLeader("k2", "v2")
+	c.waitFSM("k2", "v2")
 }
 
 // ---- scenario: add a node, then restart it ----
