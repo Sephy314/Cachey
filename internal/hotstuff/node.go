@@ -295,6 +295,14 @@ func (n *Replica) proposeLocked(cmd []byte) *Proposal {
 	self.Sig = n.sign(self)
 	n.voteForBlockLocked(self) // may form a QC (n=1) and commit
 	p := &Proposal{Block: *b, From: n.id}
+	if n.view > 0 {
+		// A replica that missed the pacemaker quorum may only enter this view on
+		// seeing its 2f+1 signed ViewChanges. Carry the certificate with every
+		// proposal in the view so lagging replicas can safely catch up.
+		for _, vc := range n.vcs[n.view] {
+			p.ViewChanges = append(p.ViewChanges, *vc)
+		}
+	}
 	p.Sig = n.sign(p)
 	return p
 }
@@ -335,9 +343,10 @@ func (n *Replica) handleProposalLocked(p *Proposal) (*Vote, []*Proposal, *Fetch)
 	}
 	b := &p.Block // blocks stored in the tree are never mutated
 	// Only the leader of the block's own view may propose it. A proposal for a
-	// PAST view is stale (a deposed leader) and ignored; a proposal for a
-	// FUTURE view means this replica is behind — it advances to that view so
-	// it can keep following the current leader (fast catch-up).
+	// PAST views are stale (a deposed leader). A future-view proposal is not
+	// sufficient evidence to change views either: only a 2f+1 ViewChange quorum
+	// may do that. Otherwise a single Byzantine leader proposal could bypass the
+	// pacemaker's view-transition safety gate.
 	if p.From != n.leaderOf(b.View) {
 		return nil, nil, nil
 	}
@@ -345,6 +354,9 @@ func (n *Replica) handleProposalLocked(p *Proposal) (*Vote, []*Proposal, *Fetch)
 		return nil, nil, nil
 	}
 	if b.View > n.view {
+		if !n.proposalViewCertValidLocked(b.View, p.ViewChanges) {
+			return nil, nil, nil
+		}
 		n.enterViewLocked(b.View)
 	}
 	if b.ID != blockID(b.View, b.Height, b.Parent, b.Cmd) {
@@ -395,6 +407,24 @@ func (n *Replica) handleProposalLocked(p *Proposal) (*Vote, []*Proposal, *Fetch)
 		}
 	}
 	return vote, kids, nil
+}
+
+// proposalViewCertValidLocked validates the pacemaker evidence carried by a
+// future-view proposal. A proposal alone cannot change views: it must include
+// 2f+1 distinct, signed ViewChanges for exactly that view.
+func (n *Replica) proposalViewCertValidLocked(view uint64, vcs []ViewChange) bool {
+	if len(vcs) < 2*n.f+1 {
+		return false
+	}
+	seen := make(map[string]bool, len(vcs))
+	for i := range vcs {
+		vc := &vcs[i]
+		if vc.View != view || !n.members[vc.From] || seen[vc.From] || !n.verify(vc.From, vc.Sig, *vc) {
+			return false
+		}
+		seen[vc.From] = true
+	}
+	return len(seen) >= 2*n.f+1
 }
 
 // addBlockLocked inserts a validated block into the tree (raising head when it

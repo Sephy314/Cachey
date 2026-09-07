@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
@@ -51,11 +52,18 @@ type HotStuffNodeConfig struct {
 	HSAddr string   // hotstuff RPC listen address, e.g. "127.0.0.1:9201"
 	Peers  []string // peer node ids (fixed membership; no dynamic join)
 	Leader string   // view-0 leader id (defaults to ID)
+	// ValidatorKeys is the fixed validator identity configuration. It must
+	// contain cfg.ID and every entry in Peers; Hello only proves possession of
+	// these configured keys and never establishes trust on first connection.
+	ValidatorKeys map[string]ed25519.PublicKey
 }
 
 // OpenHotStuffNode opens (or recovers) a persistent HotStuff node and returns
 // it with its transport already listening on cfg.HSAddr.
 func OpenHotStuffNode(cfg HotStuffNodeConfig) (*HotStuffNode, error) {
+	if cfg.ID == "" || cfg.Dir == "" || cfg.HSAddr == "" {
+		return nil, fmt.Errorf("hotstuff node: id, dir and HSAddr are required")
+	}
 	if cfg.Leader == "" {
 		cfg.Leader = cfg.ID
 	}
@@ -63,6 +71,9 @@ func OpenHotStuffNode(cfg HotStuffNodeConfig) (*HotStuffNode, error) {
 	//    previously pinned peer keys, BEFORE any network traffic.
 	priv, err := loadHSIdentity(cfg.Dir, cfg.ID)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateHSValidatorKeys(cfg, priv); err != nil {
 		return nil, err
 	}
 	st := store.NewCacheyStore()
@@ -82,12 +93,9 @@ func OpenHotStuffNode(cfg HotStuffNodeConfig) (*HotStuffNode, error) {
 		return nil, err
 	}
 	tr.SetNode(node)
-	bound, err := tr.Listen(cfg.HSAddr)
-	if err != nil {
+	if err := tr.SetValidatorKeys(cfg.ValidatorKeys); err != nil {
 		return nil, err
 	}
-	closeOnErr := func() { tr.Close() }
-	tr.RegisterPeer(cfg.ID, bound) // advertise our own RPC address
 
 	// 2. Shared WAL recovery: store snapshot first, then every record — store
 	//    mutations into the FSM, engine records into the engine.
@@ -104,12 +112,21 @@ func OpenHotStuffNode(cfg HotStuffNodeConfig) (*HotStuffNode, error) {
 		Snapshot: st.Snapshot,
 	})
 	if err != nil {
-		closeOnErr()
 		return nil, err
 	}
 	sharedWAL = w
 	node.SetLogStore(hotstuff.NewWALLogStore(w))
 	node.FinishRecovery()
+
+	// Do not make the node reachable until both its FSM and consensus state are
+	// fully recovered and the durable apply hook is wired. Receiving a proposal
+	// before this point could otherwise commit against partial state.
+	bound, err := tr.Listen(cfg.HSAddr)
+	if err != nil {
+		w.Close()
+		return nil, err
+	}
+	tr.RegisterPeer(cfg.ID, bound) // advertise our own RPC address
 	return &HotStuffNode{
 		ID:     cfg.ID,
 		Dir:    cfg.Dir,
@@ -120,6 +137,22 @@ func OpenHotStuffNode(cfg HotStuffNodeConfig) (*HotStuffNode, error) {
 		CS:     NewHotStuffClusterStore(node, st),
 		HSAddr: bound,
 	}, nil
+}
+
+func validateHSValidatorKeys(cfg HotStuffNodeConfig, priv ed25519.PrivateKey) error {
+	if len(cfg.ValidatorKeys) != len(cfg.Peers)+1 {
+		return fmt.Errorf("hotstuff node %s: validator key configuration must contain every member", cfg.ID)
+	}
+	self, ok := cfg.ValidatorKeys[cfg.ID]
+	if !ok || !bytes.Equal(self, priv.Public().(ed25519.PublicKey)) {
+		return fmt.Errorf("hotstuff node %s: configured key does not match persistent identity", cfg.ID)
+	}
+	for _, peer := range cfg.Peers {
+		if pub, ok := cfg.ValidatorKeys[peer]; !ok || len(pub) != ed25519.PublicKeySize {
+			return fmt.Errorf("hotstuff node %s: missing validator key for peer %q", cfg.ID, peer)
+		}
+	}
+	return nil
 }
 
 // Close shuts the node's transport down. The WAL is flushed by its owner

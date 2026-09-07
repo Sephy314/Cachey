@@ -22,9 +22,9 @@
 >   재시작 시 FSM을 그 record들로 재구성(엔진은 watermark 아래 재실행 안 함). 재시작 테스트
 >   `TestHotStuffPersistentRestart`로 데이터 생존 검증.
 > - **신원/키 핀 영속(P0)**: 노드 개인키를 디스크에 영속(`hsidentity.json`, `Config.PrivateKey`
->   주입) — 재시작 후에도 공개키 안정, 과거 QC 서명 검증 유지. peer 키는 1회 핀 고정 후
->   교체 거부(`SetPeerKey`), Hello는 설정된 멤버만 + 기존 핀과 다른 키면 연결 거부, 핀은
->   `hspeers.json`에 영속. (첫 부팅 TOFU 창은 여전 — 프로덕션은 mTLS 권장.)
+>   주입) — 재시작 후에도 공개키 안정, 과거 QC 서명 검증 유지. validator 공개키는
+>   `HotStuffNodeConfig.ValidatorKeys`로 listener 시작 전에 고정하며 Hello는 해당 키의
+>   소유만 증명한다(TOFU 없음). 기존 핀과 다른 키는 연결 거부하고 핀은 `hspeers.json`에 영속.
 > - **transport Close**: `stopCh` 닫고 accept loop가 `net.ErrClosed`로 종료(busy-loop 방지).
 > - **store flush 보정**: Chained HotStuff는 팔로워가 리더보다 한 블록 늦게 커밋 → 스토어
 >   `propose()`가 리더 커밋 후 빈 블록 하나를 추가 flush해 팔로워가 최종 QC를 접도록 함.
@@ -68,8 +68,8 @@
 - $n = 3f+1$ 고정 멤버(단독 1, 4, 7, …). 리더 포함 최대 $f$개의 Byzantine.
 - 부분 동기: GST 후 유계 지연 $\Delta$. 안전은 항상, 활성(liveness)은 GST 후.
 - 메시지 인증: 리더 제안/부분 투표를 Ed25519로 서명 (PBFT M3 방식 계승).
-- 키 분배: 최초 홉 TOFU(첫 수신 시 공개키 등록) — PBFT와 동일한 한계/업그레이드 경로
-  (클러스터 설정에 키 고정, 또는 전송 TLS).
+- 키 분배: validator 공개키는 클러스터 구성에서 사전 고정하고, Hello는 그 키의 소유만
+  확인한다. 최초 수신 TOFU는 validator 신원에 사용하지 않는다.
 - 리더: 정렬된 멤버셋에 대해 결정적 라운드-로빈. 현재 리더가 진행(progress)하면
   유임(§6 pacemaker의 "incumbent leader chaining"), 타임아웃 시 다음 리더로 동기화.
 - 클라이언트 쓰기는 현재 리더(primary)로만; 비리더는 `ErrNotLeader` + 리다이렉트 힌트.
@@ -222,7 +222,7 @@ Non-validator ⇒ cannot contribute to quorum
 
 **패턴 계승 (PBFT에서 복사-수정, 새 패키지로 이동)**
 - `internal/hotstuff/`: Ed25519 sign/verify 헬퍼, TCP NDJSON 멀티캐스트 transport +
-  Hello 키 교환(TOFU) 패턴, TLS on/off 패턴, WAL LogStore 패턴, 테스트용
+  구성된 validator 키와 Hello 소유 증명 패턴, TLS on/off 패턴, WAL LogStore 패턴, 테스트용
   인메모리 transport/클러스터 부트스트랩 헬퍼.
 - `internal/server/hotstuff_cluster.go`: `PbftClusterStore`의 쌍대 —
   `NewHotstuffClusterStore`, `NewHotstuffApply`, read-your-writes, 리더 리다이렉트.
@@ -276,7 +276,8 @@ Non-validator ⇒ cannot contribute to quorum
     더미 노드/비직접 완화는 미적용(현 설계로 충분).
 - **HS-M3 — Ed25519 인증 — 구현 완료**: 제안/투표/뷰체인지/블록응답 서명·검증, QC =
   (voter, sig) 2f+1 개별 검증, genesis QC는 신뢰 루트로 특례(B1만 실을 수 있어
-  안전), 키 배선은 신뢰 부트스트랩(`SetPeerKey`, pbft TOFU와 대칭; TCP/mTLS는 후순위),
+  안전), 키 배선은 사전 구성된 validator 공개키로 신뢰 부트스트랩(`SetPeerKey`; Hello는
+  해당 키 소유 증명, mTLS는 전송 계층 강화로 후순위),
   수신 모든 메시지가 `From == 서명자`여야 통과(위조 거부), 변조 거부.
   - 파일: `auth.go`(신규), `message.go`(`json:"sig,omitempty"` 태그 — canonical에서
     `sig` 삭제가 동작하도록 소문자 태그 필수), `node.go`/`viewchange.go`(모든 발신
@@ -318,7 +319,7 @@ Non-validator ⇒ cannot contribute to quorum
     베이스 QC처럼 certified 블록이 미도착인 순간의 크래시는 해당 QC를 잃을 수 있음
     (재참여로 복구, 안전성 무관).
 - **HS-M5 — 서버 통합 & PBFT 삭제 — 구현 완료**: `internal/hotstuff/tcp_transport.go`
-  (NDJSON TCP, 연결마다 Hello로 신원 Ed25519 공개키 교환(TOFU) + `ConnectPeers`
+  (NDJSON TCP, 연결마다 사전 구성 validator key를 검증하는 Hello + `ConnectPeers`
   full-mesh 키 교환), `internal/server/hotstuff_cluster.go`(`HotStuffClusterStore`
   — 리더만 쓰기, 리더가 커맨드 블록 위 빈 블록을 flush해 3-chain 커밋 유도;
   `NewHotStuffApply`), `internal/server/hotstuff_cluster_test.go`(4-노드 TCP
@@ -327,9 +328,9 @@ Non-validator ⇒ cannot contribute to quorum
   `OpPBFT` 제거(store는 `OpHotStuff`를 no-op으로), `cmd/cacheyd`/`README.md`/`mtls`
   참조 정리. `cacheyd -consensus hotstuff` wiring은 후순위(고정 멤버 정적 피어 리스트).
   - 잡은 것: HotStuff 메시지 패턴(제안 리더→전체, 투표 전체→리더)은 팔로워끼리
-    절대 연결하지 않아 TOFU 키 교환만으론 팔로워가 QC(2f+1 멤버 투표)를 검증할 수
-    없음 → 시작 시 `ConnectPeers`로 전 메시지 mesh 키 교환 필요(pbft는 broadcast라
-    자연 full-mesh).
+    절대 연결하지 않아 transport 연결은 시작 시 `ConnectPeers`로 전 메시지 mesh를
+    만든다(pbft는 broadcast라 자연 full-mesh). 키 신뢰는 이 연결 이전의 validator
+    구성으로 이미 확정된다.
 - **HS-M5 이후(후순위)**: `cacheyd -consensus hotstuff` wiring(정적 피어 리스트),
   커맨드 배칭, threshold signature QC, 체크포인트/상태 전송, 동적 멤버십.
 

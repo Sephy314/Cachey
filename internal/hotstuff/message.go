@@ -8,9 +8,10 @@ import "context"
 // Since HS-M3 the proposal carries the proposer's Ed25519 signature over the
 // whole block, so receivers can authenticate the leader and detect tampering.
 type Proposal struct {
-	Block Block  `json:"block"`
-	From  string `json:"from"` // proposing leader id
-	Sig   []byte `json:"sig,omitempty"`
+	Block       Block        `json:"block"`
+	From        string       `json:"from"`                   // proposing leader id
+	ViewChanges []ViewChange `json:"view_changes,omitempty"` // 2f+1 proof when entering a new view
+	Sig         []byte       `json:"sig,omitempty"`
 }
 
 // Vote is one replica's acceptance of a block: a claim "I accept the block

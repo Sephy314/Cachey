@@ -19,6 +19,21 @@ import (
 // exchange, persisted peer pins, leader resolver).
 func bootPersistentCluster(t *testing.T, ids []string, base string) map[string]*HotStuffNode {
 	t.Helper()
+	validatorKeys := make(map[string]ed25519.PublicKey, len(ids))
+	// Establish immutable validator identities before any node becomes network
+	// visible. OpenHotStuffNode verifies its local identity against this map and
+	// the transport checks every Hello against the same configured key.
+	for _, id := range ids {
+		dir := filepath.Join(base, id)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		priv, err := loadHSIdentity(dir, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		validatorKeys[id] = priv.Public().(ed25519.PublicKey)
+	}
 	nodes := make(map[string]*HotStuffNode)
 	for _, id := range ids {
 		dir := filepath.Join(base, id)
@@ -27,7 +42,7 @@ func bootPersistentCluster(t *testing.T, ids []string, base string) map[string]*
 		}
 		n, err := OpenHotStuffNode(HotStuffNodeConfig{
 			ID: id, Dir: dir, HSAddr: "127.0.0.1:0",
-			Peers: peersOf(ids, id), Leader: ids[0],
+			Peers: peersOf(ids, id), Leader: ids[0], ValidatorKeys: validatorKeys,
 		})
 		if err != nil {
 			t.Fatalf("OpenHotStuffNode(%s): %v", id, err)
@@ -169,5 +184,23 @@ func TestHotStuffPeerKeyPinned(t *testing.T) {
 	// Re-pinning the SAME key is a no-op success.
 	if !p1.SetPeerKey(ids[0], pub) {
 		t.Fatal("re-pinning the same key should succeed")
+	}
+}
+
+// TestOpenHotStuffNodeRequiresFullValidatorConfiguration ensures the durable
+// node cannot accidentally fall back to Hello TOFU on a first boot: every
+// validator key must be fixed before the listener is opened.
+func TestOpenHotStuffNodeRequiresFullValidatorConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	priv, err := loadHSIdentity(dir, "n0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = OpenHotStuffNode(HotStuffNodeConfig{
+		ID: "n0", Dir: dir, HSAddr: "127.0.0.1:0", Peers: []string{"n1"},
+		ValidatorKeys: map[string]ed25519.PublicKey{"n0": priv.Public().(ed25519.PublicKey)},
+	})
+	if err == nil {
+		t.Fatal("incomplete validator key configuration was accepted")
 	}
 }

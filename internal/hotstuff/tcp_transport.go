@@ -2,6 +2,7 @@ package hotstuff
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
@@ -17,10 +18,10 @@ import (
 // HotStuff messages are one-way: the transport writes each message to a peer's
 // persistent outbound connection and never waits for a reply.
 //
-// Key exchange (HS-M3) happens on every (re)connection: each side first sends a
-// Hello carrying its identity public key, and the peer registers it (trust on
-// first use) so message signatures can be verified. mTLS (pinning keys to
-// certificate identities) is the documented upgrade path, out of scope here.
+// Key exchange (HS-M3) happens on every (re)connection, but Hello is only a
+// proof of possession check against a public key fixed in the validator
+// configuration. It is never trust-on-first-use: validator identities must be
+// established before the transport becomes network-visible.
 
 // tcpWriteTimeout bounds a single outbound message write and a dial.
 const tcpWriteTimeout = 5 * time.Second
@@ -42,8 +43,8 @@ type wireMsg struct {
 }
 
 // Hello introduces a replica on a fresh connection: its id and identity public
-// key. The receiver registers the key (TOFU) so it can verify the sender's
-// message signatures (HS-M3).
+// key. The receiver compares that key with the preconfigured validator key
+// before accepting any message signatures (HS-M3).
 type Hello struct {
 	ID  string `json:"id"`
 	Pub []byte `json:"pub"`
@@ -66,15 +67,16 @@ func encodeMsg(kind string, v any) ([]byte, error) {
 // connection per peer and reconnects automatically after failures. Inbound
 // connections each run a read loop that dispatches to the local node.
 type TCPTransport struct {
-	node      *Replica
-	peerAddrs map[string]string
-	ln        gonet.Listener
-	conns     map[string]*peerConn
-	connMu    sync.Mutex
-	stopCh    chan struct{}
-	doneCh    chan struct{}
-	closeOnce sync.Once
-	fault     func(from, to string) bool
+	node          *Replica
+	peerAddrs     map[string]string
+	validatorKeys map[string]ed25519.PublicKey
+	ln            gonet.Listener
+	conns         map[string]*peerConn
+	connMu        sync.Mutex
+	stopCh        chan struct{}
+	doneCh        chan struct{}
+	closeOnce     sync.Once
+	fault         func(from, to string) bool
 }
 
 // peerConn is one outbound connection to a peer.
@@ -89,12 +91,37 @@ type peerConn struct {
 // after construction via SetPeers / RegisterPeer.
 func NewTCPTransport(node *Replica) *TCPTransport {
 	return &TCPTransport{
-		node:      node,
-		peerAddrs: make(map[string]string),
-		conns:     make(map[string]*peerConn),
-		stopCh:    make(chan struct{}),
-		doneCh:    make(chan struct{}),
+		node:          node,
+		peerAddrs:     make(map[string]string),
+		validatorKeys: make(map[string]ed25519.PublicKey),
+		conns:         make(map[string]*peerConn),
+		stopCh:        make(chan struct{}),
+		doneCh:        make(chan struct{}),
 	}
+}
+
+// SetValidatorKeys fixes the identity public key for every validator. It must
+// be called before Listen or ConnectPeers. Hello messages are accepted only
+// when they present the exact configured key for their claimed ID.
+func (t *TCPTransport) SetValidatorKeys(keys map[string]ed25519.PublicKey) error {
+	t.connMu.Lock()
+	node := t.node
+	t.connMu.Unlock()
+	if node == nil {
+		return errors.New("hotstuff transport: no node")
+	}
+	for id, pub := range keys {
+		if len(pub) != ed25519.PublicKeySize || !node.SetPeerKey(id, pub) {
+			return errors.New("hotstuff transport: invalid or conflicting validator key for " + id)
+		}
+	}
+	t.connMu.Lock()
+	t.validatorKeys = make(map[string]ed25519.PublicKey, len(keys))
+	for id, pub := range keys {
+		t.validatorKeys[id] = append(ed25519.PublicKey(nil), pub...)
+	}
+	t.connMu.Unlock()
+	return nil
 }
 
 // SetPeers records the peer address map (id -> host:port).
@@ -206,7 +233,7 @@ func (t *TCPTransport) acceptLoop(ln gonet.Listener) {
 func (t *TCPTransport) handleConn(conn gonet.Conn) {
 	defer conn.Close()
 	rd := bufio.NewReader(conn)
-	peer, ok := t.exchangeHello(conn, rd)
+	peer, ok := t.exchangeHello(conn, rd, "")
 	if !ok {
 		return
 	}
@@ -222,18 +249,10 @@ func (t *TCPTransport) handleConn(conn gonet.Conn) {
 	}
 }
 
-// exchangeHello sends our Hello on conn and reads the peer's, pinning its key.
-// It returns the peer's id. Two rules keep the Hello from being an identity
-// attack (HS-M5):
-//
-//   - membership: only a Hello from a CONFIGURED peer (one whose address we
-//     know) is accepted — an arbitrary dialer cannot claim to be someone we
-//     are not expecting;
-//   - pinning: the claimed public key is registered only if none is pinned yet
-//     for that id (or the same key is offered again). A Hello offering a
-//     DIFFERENT key for an already-pinned member is an impostor and the
-//     connection is dropped, so a live peer's key can never be overwritten.
-func (t *TCPTransport) exchangeHello(conn gonet.Conn, rd *bufio.Reader) (string, bool) {
+// exchangeHello sends our Hello and checks the peer's response against the
+// configured validator key. expected is set for an outbound dial, binding the
+// connection target to the claimed validator identity.
+func (t *TCPTransport) exchangeHello(conn gonet.Conn, rd *bufio.Reader, expected string) (string, bool) {
 	t.connMu.Lock()
 	node := t.node
 	t.connMu.Unlock()
@@ -264,13 +283,10 @@ func (t *TCPTransport) exchangeHello(conn gonet.Conn, rd *bufio.Reader) (string,
 		return "", false
 	}
 	t.connMu.Lock()
-	_, known := t.peerAddrs[h.ID]
+	configured, known := t.validatorKeys[h.ID]
 	t.connMu.Unlock()
-	if !known {
-		return "", false // not a configured peer — do not pin an impostor
-	}
-	if !node.SetPeerKey(h.ID, ed25519.PublicKey(h.Pub)) {
-		return "", false // a different key is already pinned: impostor, drop
+	if !known || (expected != "" && h.ID != expected) || !bytes.Equal(h.Pub, configured) {
+		return "", false
 	}
 	return h.ID, true
 }
@@ -389,12 +405,13 @@ func (t *TCPTransport) peerConn(peer string) (*peerConn, error) {
 	t.connMu.Lock()
 	pc := t.conns[peer]
 	addr := t.peerAddrs[peer]
-	t.connMu.Unlock()
 	if pc == nil {
 		pc = &peerConn{addr: addr}
-		t.connMu.Lock()
 		t.conns[peer] = pc
-		t.connMu.Unlock()
+	}
+	t.connMu.Unlock()
+	if addr == "" {
+		return nil, errors.New("hotstuff transport: unknown peer " + peer)
 	}
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
@@ -406,7 +423,7 @@ func (t *TCPTransport) peerConn(peer string) (*peerConn, error) {
 		return nil, err
 	}
 	rd := bufio.NewReader(conn)
-	if _, ok := t.exchangeHello(conn, rd); !ok {
+	if _, ok := t.exchangeHello(conn, rd, peer); !ok {
 		conn.Close()
 		return nil, errors.New("hotstuff transport: key handshake with " + peer + " failed")
 	}

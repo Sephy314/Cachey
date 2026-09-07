@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/ed25519"
 	"testing"
 	"time"
 
@@ -11,8 +12,8 @@ import (
 // startHotStuffCluster boots a 4-replica HotStuff cluster over TCP (HS-M5)
 // and wraps each replica in a HotStuffClusterStore over an in-memory CacheyStore
 // FSM. Returns the stores (indexed by replica id). The view-0 leader is the
-// first id. Peer identity keys are exchanged on connect (transport Hello), so
-// no manual key wiring is needed here.
+// first id. Validator public keys are fixed before listeners open; transport
+// Hello verifies possession of those configured identities.
 func startHotStuffCluster(t *testing.T, ids []string) map[string]*HotStuffClusterStore {
 	t.Helper()
 	peersOf := func(id string) []string {
@@ -38,18 +39,30 @@ func startHotStuffCluster(t *testing.T, ids []string) map[string]*HotStuffCluste
 			t.Fatalf("NewReplica(%s): %v", id, err)
 		}
 		tr.SetNode(r)
-		if _, err := tr.Listen("127.0.0.1:0"); err != nil {
-			t.Fatalf("Listen(%s): %v", id, err)
-		}
 		cs := NewHotStuffClusterStore(r, st)
 		holders[id] = &holder{tr: tr, cs: cs}
 		stores[id] = cs
 	}
-	// Register every peer's real TCP address on every transport, and give each
-	// store a fake client-address resolver for redirect hints.
+	// Fix every validator's key before any connection is accepted. Hello only
+	// proves possession of this configured key; it never learns trust from the
+	// first peer that happens to connect.
+	validatorKeys := make(map[string]ed25519.PublicKey, len(ids))
+	for _, id := range ids {
+		validatorKeys[id] = holders[id].cs.node.PublicKey()
+	}
+	for _, id := range ids {
+		if err := holders[id].tr.SetValidatorKeys(validatorKeys); err != nil {
+			t.Fatalf("SetValidatorKeys(%s): %v", id, err)
+		}
+	}
+	// Now expose listeners, register every peer's real TCP address, and give
+	// each store a fake client-address resolver for redirect hints.
 	trAddrs := make(map[string]string, len(ids))
 	clientAddrs := make(map[string]string, len(ids))
 	for _, id := range ids {
+		if _, err := holders[id].tr.Listen("127.0.0.1:0"); err != nil {
+			t.Fatalf("Listen(%s): %v", id, err)
+		}
 		trAddrs[id] = holders[id].tr.Addr()
 		clientAddrs[id] = "client://" + id
 	}
@@ -57,10 +70,8 @@ func startHotStuffCluster(t *testing.T, ids []string) map[string]*HotStuffCluste
 		holders[id].tr.SetPeers(trAddrs)
 		stores[id].SetLeaderResolver(func(leaderID string) string { return clientAddrs[leaderID] })
 	}
-	// Full-mesh key exchange: HotStuff messages never connect followers to each
-	// other (proposals leader→all, votes all→leader), yet followers must verify
-	// QCs carrying any 2f+1 members' votes — so every node learns every
-	// member's identity key up front over the transport Hello.
+	// Full-mesh connectivity remains necessary for QC delivery, but it no longer
+	// establishes key trust: validatorKeys above did that before Listen.
 	for _, id := range ids {
 		holders[id].tr.ConnectPeers(time.Now().Add(10 * time.Second))
 	}

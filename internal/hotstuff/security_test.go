@@ -42,6 +42,29 @@ func TestSingleViewChangeCannotJumpView(t *testing.T) {
 	}
 }
 
+// TestFutureProposalCannotJumpView closes the equivalent bypass through the
+// proposal path: even an authentic proposal from leaderOf(futureView) cannot
+// move a replica until the pacemaker has collected a ViewChange quorum.
+func TestFutureProposalCannotJumpView(t *testing.T) {
+	f, tr := newFollower()
+	b := Block{View: 1, Height: 1, Parent: genesisID, Cmd: []byte("a"), Justify: quorumQC(genesisID, 0)}
+	b.ID = blockID(b.View, b.Height, b.Parent, b.Cmd)
+	p := &Proposal{Block: b, From: testPeer1} // leaderOf(1) for this fixture
+	_, priv := testKeyOf(testPeer1)
+	p.Sig = signPayload(priv, p)
+
+	f.HandleProposal(p)
+	if got := f.View(); got != 0 {
+		t.Fatalf("future proposal moved F to view %d; a ViewChange quorum is required", got)
+	}
+	f.mu.Lock()
+	blocks := len(f.blocks)
+	f.mu.Unlock()
+	if blocks != 1 || tr.voteCount(p.Block.ID) != 0 {
+		t.Fatal("future proposal must neither enter the tree nor earn a vote")
+	}
+}
+
 // TestWrongHeightVoteCannotBlockQC: a Byzantine member that signs a genuine
 // vote for a block at the WRONG height must not get it into the vote set — the
 // QC is built over the block's real height, so such a vote would fail the QC's
