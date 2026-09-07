@@ -84,6 +84,9 @@ type Node struct {
 	takeSnapshotFn    func() ([]byte, error)
 	applySnapshotFn   func([]byte) error
 	snapshotThreshold uint64
+	// metaStore persists the committed membership (see meta.go) so a restart
+	// after log compaction still knows the cluster.
+	metaStore MetaStore
 
 	// pendingStepDown defers a leader's self-removal until its final heartbeat
 	// has propagated the committed configuration to the remaining members.
@@ -765,6 +768,13 @@ func (n *Node) applyConfigLocked(cfg *Configuration) {
 	// keeps the leader in office (Raft §6); only a self-removal steps it down.
 	if n.role == RoleLeader && n.removed {
 		n.pendingStepDown = true
+	}
+	// Persist the committed membership so a crash/restart (even after the log
+	// is compacted past these config entries) can still restore the cluster.
+	if n.metaStore != nil {
+		if err := n.metaStore.Save(CommittedMeta{Voters: cfg.Voters, Addrs: cfg.Addrs}); err != nil {
+			n.logf("persist committed config failed: %v", err)
+		}
 	}
 }
 

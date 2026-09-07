@@ -30,7 +30,7 @@ func main() {
 	fs.Var(&allowClients, "allow-client", "client identity (the certificate's DNS SAN) permitted to connect; repeatable (mTLS)")
 	insecure := fs.Bool("insecure-plaintext", false, "serve WITHOUT TLS — development only, never in production")
 
-	consensus := fs.String("consensus", "", "cluster consensus engine: \"\" (standalone), \"raft\", or \"pbft\" (not implemented yet)")
+	consensus := fs.String("consensus", "", "cluster consensus engine: \"\" (standalone) or \"raft\" (pbft/hotstuff not yet)")
 	nodeID := fs.String("node-id", "", "this node's unique id in the cluster (raft cluster)")
 	clientAddr := fs.String("client-addr", "", "client-facing NDJSON listen address, e.g. 127.0.0.1:8081 (raft cluster)")
 	raftAddr := fs.String("raft-addr", "", "raft RPC listen address, e.g. 127.0.0.1:9101 (raft cluster)")
@@ -76,11 +76,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "cacheyd:", err)
 			os.Exit(1)
 		}
-	case "pbft":
-		fmt.Fprintln(os.Stderr, "cacheyd: -consensus pbft is not implemented yet; use -consensus raft")
+	case "pbft", "hotstuff":
+		fmt.Fprintln(os.Stderr, "cacheyd: -consensus pbft is not implemented; PBFT is being replaced by HotStuff — use -consensus raft for now")
 		os.Exit(1)
 	default:
-		fmt.Fprintf(os.Stderr, "cacheyd: unknown -consensus %q (want \"\", raft or pbft)\n", *consensus)
+		fmt.Fprintf(os.Stderr, "cacheyd: unknown -consensus %q (want \"\", raft, or pbft/hotstuff later)\n", *consensus)
 		os.Exit(1)
 	}
 }

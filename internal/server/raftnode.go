@@ -110,6 +110,14 @@ func OpenRaftNode(cfg RaftNodeConfig) (*RaftNode, error) {
 	// Advertise our own raft address so membership configurations carry it
 	// (see raft.Node.AddServer) and every member learns to reach us.
 	tr.RegisterPeer(cfg.ID, bound)
+	// Restore the durable committed membership (persisted on every applied
+	// config change) so a restart after the log was compacted — config entries
+	// gone — still rejoins as a full member, then record future changes.
+	ms := raft.NewFileMetaStore(cfg.Dir)
+	n.SetMetaStore(ms)
+	if m, ok, err := ms.Load(); err == nil && ok {
+		n.AdoptCommittedMeta(m)
+	}
 	return &RaftNode{
 		ID:       cfg.ID,
 		Dir:      cfg.Dir,

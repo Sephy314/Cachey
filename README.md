@@ -49,8 +49,8 @@ sharded across machines).
 > **Note:** the status table reflects what is implemented in this
 > repository today — both consensus *engines*, their integration tests, and
 > the runnable Raft cluster mode through the `cacheyd` binary are complete.
-> PBFT cluster mode through `cacheyd` and sharding keys across nodes remain on
-> the roadmap.
+> PBFT is planned to be replaced by **HotStuff**; cluster mode for it through
+> `cacheyd`, and sharding keys across nodes, remain on the roadmap.
 
 <br>
 
@@ -352,9 +352,9 @@ The roadmap splits two responsibilities:
 - **Sharding** — decides which shard owns a key and spreads load across nodes
 - **Raft** — keeps each shard's replicas consistent (already implemented and tested here)
 
-Next up is wiring PBFT cluster mode through `cacheyd` (a PBFT replica set is
-fixed at startup, so it takes a static peer list rather than bootstrap/join),
-then sharding keys across groups.
+Next up is HotStuff (PBFT is planned to be replaced by it): a HotStuff replica
+set is fixed at startup, so its `cacheyd` mode takes a static peer list rather
+than raft-style bootstrap/join. After that, keys are sharded across groups.
 
 <br>
 
