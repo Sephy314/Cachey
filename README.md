@@ -104,8 +104,8 @@ machines.
 go install github.com/Sephy314/Cachey@latest
 ```
 
-This installs the `cacheyd` binary to your `$GOPATH/bin` (or `$GOBIN`) —
-no need to clone the repository.
+This installs the `cacheyd` server and the `cachey` command-line client to
+your `$GOPATH/bin` (or `$GOBIN`) — no need to clone the repository.
 
 ### Run
 
@@ -133,8 +133,33 @@ CA helper).
 
 **2. Connect with a client**
 
-Point any TCP/NDJSON client at `127.0.0.1:8080` and start sending
-`GET` / `PUT` / `TTL` / `DEL` commands (see [Protocol](#-protocol) below).
+The `cachey` CLI talks to a server over the same NDJSON protocol, either as a
+single one-shot command or as an interactive shell. It mirrors the server's
+TLS posture — mTLS by default, plaintext only behind the explicit development
+flag:
+
+```sh
+cachey -insecure-plaintext :8080 put user alice   # one-shot
+cachey -insecure-plaintext :8080 get user
+cachey -insecure-plaintext :8080                  # interactive shell
+```
+
+`cachey` supports `get`, `put`, `del`, `ttl` (milliseconds), and `alv`
+(liveness). The `address` argument is optional and defaults to `:8080`.
+
+Against an mTLS server, pass the CA, a client certificate that is on the
+server's allowlist, and the expected server identity (its certificate's DNS
+SAN):
+
+```sh
+cachey --tls-ca ca.pem --tls-cert alice.pem --tls-key alice-key.pem \
+  --server-name server :8080 get user
+```
+
+`cachey` follows leader-redirect hints automatically, so in a cluster it
+reconnects to the current leader instead of erroring out. Any TCP/NDJSON
+client works too — the commands are just newline-delimited JSON objects as
+described in [Protocol](#-protocol) below.
 
 <br>
 
