@@ -202,10 +202,40 @@ cachey -insecure-plaintext 127.0.0.1:8083 get user        # follows the redirect
 Restarting a member from its existing `-data-dir` restores its membership —
 including after snapshots/log compaction, thanks to the durable committed
 configuration; pass `-join` again only to re-announce a changed address.
-The control endpoint is the current authorization boundary; binding it to node
-identity (certificate SAN == node id) and moving JOIN onto the node-to-node
-transport is the planned mTLS step. (Raft transport is plaintext today —
-node-to-node mTLS is not yet wired into cluster mode.)
+
+**Cluster with mutual TLS.** Cluster mode speaks mTLS on every plane with one
+certificate per node whose DNS SAN is the node id: the node↔node raft
+transport, the client-facing data endpoint, and the control endpoint all use
+it. Cache clients (e.g. `cachey`) get their own CA-signed certificates, which
+the data endpoint admit via `-allow-client`:
+
+```sh
+# node a (SAN = a) — creates the cluster
+cacheyd -consensus raft -node-id a -client-addr 127.0.0.1:8081 \
+  -control-addr 127.0.0.1:8082 -raft-addr 127.0.0.1:9101 -data-dir data/a \
+  -bootstrap -tls-ca ca.pem -tls-cert a.pem -tls-key a-key.pem \
+  -allow-client alice
+
+# node b (SAN = b) — joins through a's control endpoint
+cacheyd -consensus raft -node-id b -client-addr 127.0.0.1:8083 \
+  -control-addr 127.0.0.1:8084 -raft-addr 127.0.0.1:9102 -data-dir data/b \
+  -join 127.0.0.1:8082 -tls-ca ca.pem -tls-cert b.pem -tls-key b-key.pem \
+  -allow-client alice
+
+# cache client alice talks to node a over mTLS (pins server identity = a)
+cachey -tls-ca ca.pem -tls-cert alice.pem -tls-key alice-key.pem \
+  -server-name a 127.0.0.1:8081 put user alice
+```
+
+Node ids must be valid DNS names (no underscores), since the node mTLS
+certificates carry them as SANs. A node with no committed membership yet (a
+fresh joiner / lone bootstrap) admits any certificate signed by the cluster CA
+so the first membership can form over TLS; once a configuration applies,
+raft-transport admission is restricted to the member set. A `cachey` client
+pins one `-server-name`, so point it at a specific node (typically the
+current leader) — leader redirects hop between data endpoints that present
+different node identities. The separate control endpoint is still where JOIN
+happens (binding it to the raft transport is the remaining mTLS follow-up).
 
 <br>
 

@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/Sephy314/Cachey/internal/raft"
@@ -35,6 +36,12 @@ type RaftNodeConfig struct {
 	HeartbeatInterval time.Duration
 	ElectionTimeout   time.Duration
 	SnapshotThreshold uint64
+	// Optional node-to-node mutual TLS for the raft transport: the certificate's
+	// DNS SAN must be this node's id (see internal/mtls). All three must be set
+	// together, or none (plaintext).
+	TLSCA   []byte
+	TLSCert []byte
+	TLSKey  []byte
 }
 
 // OpenRaftNode opens (or recovers) a persistent raft node and returns it with
@@ -49,6 +56,13 @@ func OpenRaftNode(cfg RaftNodeConfig) (*RaftNode, error) {
 	st := store.NewCacheyStore()
 
 	tr := raft.NewTCPTransport(nil)
+	if len(cfg.TLSCA) > 0 || len(cfg.TLSCert) > 0 || len(cfg.TLSKey) > 0 {
+		if len(cfg.TLSCA) == 0 || len(cfg.TLSCert) == 0 || len(cfg.TLSKey) == 0 {
+			return nil, errors.New("raft node TLS requires TLSCA, TLSCert and TLSKey together")
+		}
+		// Must be enabled before the listener starts (see raft.TCPTransport).
+		tr.EnableTLS(cfg.TLSCA, cfg.TLSCert, cfg.TLSKey)
+	}
 	bound, err := tr.Listen(cfg.RaftAddr)
 	if err != nil {
 		return nil, err

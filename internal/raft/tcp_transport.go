@@ -191,15 +191,25 @@ func (t *TCPTransport) serverTLSConfig() (*tls.Config, error) {
 }
 
 // acceptPeer reports whether an inbound certificate's identity (its DNS SAN)
-// belongs to a known node: this node or a configured peer.
+// belongs to a known node: this node, a configured peer, or — before this node
+// has any committed membership (a fresh joiner / lone bootstrap) — any identity
+// that the CA already vouched for, so the first membership can form over mutual
+// TLS. Once a configuration applies, admission is restricted to the member set.
 func (t *TCPTransport) acceptPeer(identity string) bool {
 	t.connMu.Lock()
-	defer t.connMu.Unlock()
-	if t.node != nil && identity == t.node.ID() {
+	node := t.node
+	if node != nil && identity == node.ID() {
+		t.connMu.Unlock()
 		return true
 	}
 	_, known := t.peerAddrs[identity]
-	return known
+	t.connMu.Unlock()
+	if known {
+		return true
+	}
+	// CommittedMembership takes the node lock; do not hold connMu across it
+	// (applyConfigLocked takes node.mu then connMu — the reverse order).
+	return node != nil && !node.CommittedMembership()
 }
 
 // peerTLSConfig returns the cached client *tls.Config for dialing peer,

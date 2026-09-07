@@ -112,6 +112,7 @@ func (n *Node) ApplyRecoveredRecord(rec wal.Record) error {
 		// Remember the most recent configuration index restored from the WAL so
 		// AdoptCommittedMeta can reject a stale durable meta file afterwards.
 		n.recoveredConfigIndex = rec.RaftIndex
+		n.committedConfig = true
 		var peers []string
 		for _, id := range entry.Config.Voters {
 			if id != n.id {

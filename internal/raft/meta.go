@@ -94,6 +94,7 @@ func (n *Node) SetMetaStore(ms MetaStore) {
 func (n *Node) AdoptCommittedMeta(m CommittedMeta) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	n.committedConfig = true
 	if n.recoveredConfigIndex != 0 && m.Index < n.recoveredConfigIndex {
 		n.logf("keeping WAL-recovered committed config (index %d) over stale meta (index %d)",
 			n.recoveredConfigIndex, m.Index)

@@ -35,7 +35,7 @@ type clusterFlags struct {
 // runRaftCluster opens a persistent raft node, attaches a client-facing server
 // over it, and either bootstraps a fresh cluster or joins an existing one,
 // then serves until SIGINT/SIGTERM.
-func runRaftCluster(cf *clusterFlags, opts []server.Option) error {
+func runRaftCluster(cf *clusterFlags, tls *resolvedTLS) error {
 	if cf.nodeID == "" || cf.clientAddr == "" || cf.controlAddr == "" || cf.raftAddr == "" || cf.dataDir == "" {
 		return fmt.Errorf("-consensus raft requires -node-id, -client-addr, -control-addr, -raft-addr and -data-dir")
 	}
@@ -46,12 +46,21 @@ func runRaftCluster(cf *clusterFlags, opts []server.Option) error {
 		return errors.New("-consensus raft needs -bootstrap (first node) or -join <member-control-addr>")
 	}
 
+	// Node-to-node mTLS on the raft transport when certificates are given: the
+	// node's certificate SAN is its id, so peers authenticate each other.
+	var tlsCA, tlsCert, tlsKey []byte
+	if !tls.insecure {
+		tlsCA, tlsCert, tlsKey = tls.ca, tls.cert, tls.key
+	}
 	rn, err := server.OpenRaftNode(server.RaftNodeConfig{
 		ID:                cf.nodeID,
 		Dir:               cf.dataDir,
 		RaftAddr:          cf.raftAddr,
 		HeartbeatInterval: raftHeartbeat,
 		ElectionTimeout:   raftElection,
+		TLSCA:             tlsCA,
+		TLSCert:           tlsCert,
+		TLSKey:            tlsKey,
 	})
 	if err != nil {
 		return fmt.Errorf("open raft node %s: %w", cf.nodeID, err)
@@ -111,12 +120,12 @@ func runRaftCluster(cf *clusterFlags, opts []server.Option) error {
 	// Start the two planes only once this node is a member: the client-facing
 	// DATA server and the separate CONTROL server (JOIN). The control endpoint
 	// is where membership changes happen — never on the data endpoint.
-	dataSrv := server.NewServer(cf.clientAddr, server.NewClusterHandler(rn.CS), opts...)
+	dataSrv := server.NewServer(cf.clientAddr, server.NewClusterHandler(rn.CS), dataServerOpts(tls)...)
 	if err := dataSrv.Start(); err != nil {
 		return fmt.Errorf("start client server on %s: %w", cf.clientAddr, err)
 	}
 	defer dataSrv.Stop()
-	ctlSrv := server.NewServer(cf.controlAddr, server.NewControlHandler(rn.Node, rn.CS, rn.Store), opts...)
+	ctlSrv := server.NewServer(cf.controlAddr, server.NewControlHandler(rn.Node, rn.CS, rn.Store), controlServerOpts(tls)...)
 	if err := ctlSrv.Start(); err != nil {
 		return fmt.Errorf("start control server on %s: %w", cf.controlAddr, err)
 	}

@@ -42,7 +42,7 @@ func main() {
 	fs.Usage = func() { usage(fs) }
 	fs.Parse(os.Args[1:])
 
-	opts := mTLSOptions(*insecure, *tlsCA, *tlsCert, *tlsKey, allowClients)
+	tls := resolveTLS(*insecure, *tlsCA, *tlsCert, *tlsKey, allowClients)
 
 	switch *consensus {
 	case "":
@@ -59,10 +59,14 @@ func main() {
 		if len(args) == 2 {
 			dir = args[1]
 		}
-		runStandalone(args[0], dir, opts)
+		runStandalone(args[0], dir, dataServerOpts(tls))
 	case "raft":
 		if len(fs.Args()) != 0 {
 			fmt.Fprintln(os.Stderr, "cacheyd: -consensus raft takes no positional address; use -client-addr")
+			os.Exit(1)
+		}
+		if !tls.insecure && !mtls.ValidName(*nodeID) {
+			fmt.Fprintf(os.Stderr, "cacheyd: -node-id %q is not a valid DNS name; node mTLS certificates carry the node id as their DNS SAN\n", *nodeID)
 			os.Exit(1)
 		}
 		cf := &clusterFlags{
@@ -74,7 +78,7 @@ func main() {
 			bootstrap:   *bootstrap,
 			join:        *join,
 		}
-		if err := runRaftCluster(cf, opts); err != nil {
+		if err := runRaftCluster(cf, tls); err != nil {
 			fmt.Fprintln(os.Stderr, "cacheyd:", err)
 			os.Exit(1)
 		}
@@ -142,18 +146,26 @@ func runStandalone(addr, dir string, opts []server.Option) {
 	select {}
 }
 
-// mTLSOptions resolves the TLS flags into server options. TLS is the default
-// posture: a bare invocation with no TLS flags errors out rather than silently
-// serving plaintext; serving without TLS requires the explicitly named
+// resolvedTLS is the TLS material resolved from the flag set. insecure means
+// plaintext everywhere (development only).
+type resolvedTLS struct {
+	insecure      bool
+	ca, cert, key []byte
+	allowClients  map[string]bool
+}
+
+// resolveTLS validates the mTLS flags and reads the certificates. TLS is the
+// default posture: a bare invocation with no TLS flags errors out rather than
+// silently serving plaintext; serving without TLS requires the explicitly named
 // --insecure-plaintext development flag, so plaintext can never be switched on
 // by accident in production.
-func mTLSOptions(insecure bool, caPath, certPath, keyPath string, allowClients []string) []server.Option {
+func resolveTLS(insecure bool, caPath, certPath, keyPath string, allowClients []string) *resolvedTLS {
 	if insecure {
 		if caPath != "" || certPath != "" || keyPath != "" || len(allowClients) > 0 {
 			fmt.Fprintln(os.Stderr, "cacheyd: --insecure-plaintext cannot be combined with mTLS flags")
 			os.Exit(1)
 		}
-		return nil
+		return &resolvedTLS{insecure: true}
 	}
 	if caPath == "" || certPath == "" || keyPath == "" {
 		fmt.Fprintln(os.Stderr, "cacheyd: mTLS requires --tls-ca, --tls-cert and --tls-key; pass --insecure-plaintext only for local development without TLS")
@@ -171,12 +183,42 @@ func mTLSOptions(insecure bool, caPath, certPath, keyPath string, allowClients [
 		}
 		allowed[name] = true
 	}
-	cfg, err := mtls.Server(
-		mustReadFile(caPath),
-		mustReadFile(certPath),
-		mustReadFile(keyPath),
-		func(identity string) bool { return allowed[identity] },
-	)
+	return &resolvedTLS{
+		ca:           mustReadFile(caPath),
+		cert:         mustReadFile(certPath),
+		key:          mustReadFile(keyPath),
+		allowClients: allowed,
+	}
+}
+
+// dataServerOpts returns the client-facing (data-plane) TLS options, or nil in
+// plaintext mode.
+func dataServerOpts(t *resolvedTLS) []server.Option {
+	if t.insecure {
+		return nil
+	}
+	cfg, err := mtls.Server(t.ca, t.cert, t.key, func(identity string) bool {
+		return t.allowClients[identity]
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cacheyd:", err)
+		os.Exit(1)
+	}
+	return []server.Option{server.WithTLSConfig(cfg)}
+}
+
+// controlServerOpts returns the cluster-control-plane TLS options, or nil in
+// plaintext mode. The control plane (JOIN) admits any certificate signed by
+// the cluster CA whose identity is a valid name — the node role; clients are
+// kept distinct from nodes by naming convention (per-role CAs are the upgrade
+// path, see internal/mtls).
+func controlServerOpts(t *resolvedTLS) []server.Option {
+	if t.insecure {
+		return nil
+	}
+	cfg, err := mtls.Server(t.ca, t.cert, t.key, func(identity string) bool {
+		return mtls.ValidName(identity)
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "cacheyd:", err)
 		os.Exit(1)

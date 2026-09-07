@@ -92,6 +92,13 @@ type Node struct {
 	// against it so a stale durable meta never overwrites a newer committed
 	// configuration recovered from the log.
 	recoveredConfigIndex uint64
+	// committedConfig is true once this node has applied (live, recovered, or
+	// adopted from durable meta) a membership configuration. A node with no
+	// committed config yet — a fresh joiner or a lone bootstrap — has not joined
+	// a cluster, so its transport may admit any CA-signed peer to let the first
+	// membership form over mutual TLS; afterwards admission is restricted to
+	// the member set.
+	committedConfig bool
 
 	// pendingStepDown defers a leader's self-removal until its final heartbeat
 	// has propagated the committed configuration to the remaining members.
@@ -234,6 +241,15 @@ func (n *Node) Role() Role {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.role
+}
+
+// CommittedMembership reports whether this node has learned a committed
+// membership configuration (applied live, recovered from the WAL, or adopted
+// from durable meta). A node without one has not joined any cluster yet.
+func (n *Node) CommittedMembership() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.committedConfig
 }
 
 // ---- background loops ----
@@ -722,6 +738,7 @@ func (n *Node) applyCommittedLocked() {
 // joining members that were promoted to voters). idx is the raft-log index of
 // the applied configuration entry.
 func (n *Node) applyConfigLocked(cfg *Configuration, idx uint64) {
+	n.committedConfig = true
 	// Learn transport addresses of members introduced by this change so we can
 	// reach them even if we later become the leader. Without this, a member
 	// added while another node led is orphaned once leadership moves (the new
