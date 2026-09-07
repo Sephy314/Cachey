@@ -31,6 +31,13 @@ const (
 	kindAppendEntriesReply = "AppendEntriesReply"
 	kindInstallSnapshot    = "InstallSnapshot"
 	kindInstallSnapReply   = "InstallSnapshotReply"
+	// kindCtl is an opaque application control message (e.g. JOIN) carried on
+	// the raft transport. It is dispatched to the transport's control handler
+	// (SetControlHandler) rather than to the raft node, and — unlike raft RPCs
+	// — is served to any certificate the cluster CA vouches for, which is how
+	// a node that is not a member yet can ask to join.
+	kindCtl      = "ctl"
+	kindCtlReply = "ctl-reply"
 )
 
 // TCPTransport implements Transport over TCP with newline-delimited JSON
@@ -46,6 +53,10 @@ type TCPTransport struct {
 	stopCh    chan struct{}
 	doneCh    chan struct{}
 
+	// ctl, when non-nil, handles inbound control messages. It receives the
+	// sender's identity (its certificate DNS SAN, "" in plaintext) and the raw
+	// request payload and returns the raw reply payload.
+	ctl func(peer string, data []byte) ([]byte, error)
 	// mTLS (see EnableTLS). When tlsOn, the listener wraps connections in TLS
 	// and outbound dials present our cert and pin the peer's identity.
 	// peerTLS caches one client *tls.Config per peer; serverTLS is the
@@ -93,6 +104,17 @@ func NewTCPTransport(node *Node) *TCPTransport {
 	}
 }
 
+// SetControlHandler installs the application control handler. When set, inbound
+// control (ctl) messages are delivered to fn with the sender's identity ("" in
+// plaintext). Control is served to any certificate the cluster CA vouches for,
+// so a not-yet-member node can ask to join; raft RPCs, in contrast, are only
+// served to known members (see dispatch).
+func (t *TCPTransport) SetControlHandler(fn func(peer string, data []byte) ([]byte, error)) {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	t.ctl = fn
+}
+
 // SetPeers records the peer address map (ID → host:port).
 func (t *TCPTransport) SetPeers(addrs map[string]string) {
 	t.connMu.Lock()
@@ -106,6 +128,19 @@ func (t *TCPTransport) RegisterPeer(id, addr string) {
 	t.connMu.Lock()
 	defer t.connMu.Unlock()
 	t.peerAddrs[id] = addr
+}
+
+// PeerAddrs returns a copy of the peer address map (ID → host:port). It lets
+// Node.AddServer embed the current membership's addresses in a committed
+// configuration, making it self-describing.
+func (t *TCPTransport) PeerAddrs() map[string]string {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	out := make(map[string]string, len(t.peerAddrs))
+	for k, v := range t.peerAddrs {
+		out[k] = v
+	}
+	return out
 }
 
 // SetNode wires the local raft node that inbound RPCs are dispatched to.
@@ -177,9 +212,22 @@ func (t *TCPTransport) serverTLSConfig() (*tls.Config, error) {
 	return cfg, nil
 }
 
-// acceptPeer reports whether an inbound certificate's identity (its DNS SAN)
-// belongs to a known node: this node or a configured peer.
-func (t *TCPTransport) acceptPeer(identity string) bool {
+// acceptPeer reports whether an inbound TLS peer may CONNECT. It returns true
+// for every certificate the cluster CA already vouched for (mtls runs its chain
+// check before this callback): an established member must be able to accept a
+// not-yet-member node's control (JOIN) connection. Per-message gating in
+// dispatch then ensures such a peer can only send control messages, never raft
+// RPCs.
+func (t *TCPTransport) acceptPeer(string) bool { return true }
+
+// isMemberPeer reports whether identity (a peer's certificate DNS SAN) is this
+// node or a known peer (a member, or a member being caught up). Raft RPCs are
+// only served to known peers; control messages are served to any CA-vouched
+// peer. An empty identity (plaintext) is always treated as a member.
+func (t *TCPTransport) isMemberPeer(identity string) bool {
+	if identity == "" {
+		return true // plaintext: no identity enforcement (development)
+	}
 	t.connMu.Lock()
 	defer t.connMu.Unlock()
 	if t.node != nil && identity == t.node.ID() {
@@ -238,12 +286,16 @@ func (t *TCPTransport) acceptLoop() {
 func (t *TCPTransport) handleConn(conn net.Conn) {
 	defer conn.Close()
 	rd := bufio.NewReader(conn)
+	peer := "" // the peer's certificate identity; learned after the lazy TLS handshake
 	for {
 		line, err := rd.ReadBytes('\n')
 		if err != nil {
 			return
 		}
-		reply, err := t.dispatch(line)
+		if peer == "" {
+			peer = mtls.PeerIdentity(conn)
+		}
+		reply, err := t.dispatch(line, peer)
 		if err != nil {
 			return
 		}
@@ -253,11 +305,32 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 	}
 }
 
-// dispatch routes one wire message to the local node's Raft handler.
-func (t *TCPTransport) dispatch(line []byte) ([]byte, error) {
+// dispatch routes one wire message. Raft RPCs are served only to known peers
+// (isMemberPeer); the application control (ctl) message is served to any
+// CA-vouched peer via the control handler, with the sender's identity passed
+// through so the handler can bind it to what the message claims.
+func (t *TCPTransport) dispatch(line []byte, peer string) ([]byte, error) {
 	var wm wireMsg
 	if err := json.Unmarshal(line, &wm); err != nil {
 		return nil, err
+	}
+	if wm.Kind == kindCtl {
+		t.connMu.Lock()
+		ctl := t.ctl
+		t.connMu.Unlock()
+		if ctl == nil {
+			return nil, errors.New("raft: no control handler")
+		}
+		reply, err := ctl(peer, wm.Data)
+		if err != nil {
+			return nil, err
+		}
+		return rawMsg(kindCtlReply, reply)
+	}
+	if !t.isMemberPeer(peer) {
+		// A non-member (CA-vouched but not in the cluster) may send control
+		// messages but never raft RPCs.
+		return nil, errors.New("raft: rpc from non-member " + peer)
 	}
 	t.connMu.Lock()
 	node := t.node
@@ -303,6 +376,15 @@ func (t *TCPTransport) dispatch(line []byte) ([]byte, error) {
 	return out, nil
 }
 
+// rawMsg frames raw JSON payload bytes (no re-encoding) as a wire message.
+func rawMsg(kind string, raw []byte) ([]byte, error) {
+	b, err := json.Marshal(wireMsg{Kind: kind, Data: json.RawMessage(raw)})
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
+}
+
 // encodeMsg marshals v into a framed wire message with a trailing newline.
 func encodeMsg(kind string, v any) ([]byte, error) {
 	data, err := json.Marshal(v)
@@ -334,6 +416,46 @@ func (t *TCPTransport) SendInstallSnapshot(ctx context.Context, peer string, arg
 	var reply InstallSnapshotReply
 	err := t.roundTrip(ctx, peer, kindInstallSnapshot, args, &reply, kindInstallSnapReply)
 	return &reply, err
+}
+
+// SendControl sends an application control message (raw JSON payload) to peer
+// over the shared per-peer connection and returns the raw reply payload. It is
+// the transport-level channel for cluster control such as JOIN.
+func (t *TCPTransport) SendControl(ctx context.Context, peer string, req []byte) ([]byte, error) {
+	if t.partitioned(peer) {
+		return nil, errors.New("raft: partitioned")
+	}
+	pc, err := t.peerConn(peer)
+	if err != nil {
+		return nil, err
+	}
+	pc.mu.Lock()
+	if pc.conn == nil {
+		pc.mu.Unlock()
+		t.forget(peer)
+		return nil, errors.New("raft: peer connection closed")
+	}
+	if err := pc.writeRawBytes(kindCtl, req); err != nil {
+		pc.mu.Unlock()
+		t.forget(peer)
+		return nil, err
+	}
+	line, err := pc.readReply()
+	pc.mu.Unlock()
+	if err != nil {
+		t.forget(peer)
+		return nil, err
+	}
+	var wm wireMsg
+	if err := json.Unmarshal(line, &wm); err != nil {
+		t.forget(peer)
+		return nil, err
+	}
+	if wm.Kind != kindCtlReply {
+		t.forget(peer)
+		return nil, errors.New("raft: unexpected reply kind " + wm.Kind)
+	}
+	return []byte(wm.Data), nil
 }
 
 func (t *TCPTransport) roundTrip(ctx context.Context, peer, reqKind string, req, reply any, replyKind string) error {
@@ -455,10 +577,24 @@ func (pc *peerConn) writeReq(kind string, v any) error {
 	if err != nil {
 		return err
 	}
+	return pc.writeBytes(b)
+}
+
+// writeRawBytes frames raw JSON payload bytes as a control message and writes
+// them without re-encoding (the payload is already JSON).
+func (pc *peerConn) writeRawBytes(kind string, raw []byte) error {
+	b, err := rawMsg(kind, raw)
+	if err != nil {
+		return err
+	}
+	return pc.writeBytes(b)
+}
+
+func (pc *peerConn) writeBytes(b []byte) error {
 	if err := pc.conn.SetWriteDeadline(time.Now().Add(rpcTimeout)); err != nil {
 		return err
 	}
-	_, err = pc.conn.Write(b)
+	_, err := pc.conn.Write(b)
 	return err
 }
 

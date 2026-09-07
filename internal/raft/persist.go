@@ -109,6 +109,11 @@ func (n *Node) ApplyRecoveredRecord(rec wal.Record) error {
 	// tail is corrected by the live leader's LeaderCommit. Persisting the
 	// committed config separately (with term/votedFor) is the upgrade path.
 	if entry.Config != nil {
+		// Legacy fallback: adopt the voter set from the last config entry in the
+		// recovered log. This is only used when no durable committed meta exists
+		// (pre-meta data dirs). When raft.meta is present it is authoritative
+		// (written at apply = commit), so a WAL-only config — possibly an
+		// uncommitted tail — never overrides it (see AdoptCommittedMeta).
 		var peers []string
 		for _, id := range entry.Config.Voters {
 			if id != n.id {
@@ -116,6 +121,16 @@ func (n *Node) ApplyRecoveredRecord(rec wal.Record) error {
 			}
 		}
 		n.peers = peers
+		// Register the addresses carried by this configuration so a restarted
+		// member remembers how to reach the cluster (mirrors applyConfigLocked,
+		// which does the same on live apply).
+		if pr, ok := n.tr.(PeerRegistrar); ok {
+			for id, addr := range entry.Config.Addrs {
+				if addr != "" {
+					pr.RegisterPeer(id, addr)
+				}
+			}
+		}
 	}
 	n.mu.Unlock()
 	return nil
