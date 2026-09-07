@@ -29,9 +29,10 @@ Two consensus engines are implemented and tested end to end:
   messages, view change with Byzantine-safe prepared certificates, and
   WAL-backed recovery of the ordered log.
 
-The runnable `cacheyd` binary still starts a single node today; wiring it
-into a multi-node cluster is the next step before keys are sharded across
-machines.
+The `cacheyd` binary runs both modes: a single standalone node by default, and a
+replicated **Raft cluster** with `-consensus raft` — the first node bootstraps
+with `-bootstrap`, and each later node joins with `-join` (before keys are
+sharded across machines).
 
 <br>
 
@@ -46,9 +47,10 @@ machines.
 | 🔌 | **Stable client protocol** | ✅ NDJSON protocol + leader-redirect hints |
 
 > **Note:** the status table reflects what is implemented in this
-> repository today — both consensus *engines* and their integration tests
-> are complete, while exposing cluster mode through the `cacheyd` binary
-> and sharding keys across nodes remain on the roadmap.
+> repository today — both consensus *engines*, their integration tests, and
+> the runnable Raft cluster mode through the `cacheyd` binary are complete.
+> PBFT cluster mode through `cacheyd` and sharding keys across nodes remain on
+> the roadmap.
 
 <br>
 
@@ -70,6 +72,8 @@ machines.
 - Log compaction + `InstallSnapshot` catch-up for joining and restarting nodes
 - End-to-end cluster tests: replication, failover, restart recovery, add/remove
   membership, stale-node election loss, network partitions, snapshot restore
+- Runnable cluster mode — `cacheyd -consensus raft` forms a multi-node
+  replicated cluster (bootstrap + join, see Quick Start)
 
 **Security — mutual TLS** (`internal/mtls`)
 - Client ↔ server mTLS: the cache server requires a client certificate signed
@@ -161,6 +165,37 @@ reconnects to the current leader instead of erroring out. Any TCP/NDJSON
 client works too — the commands are just newline-delimited JSON objects as
 described in [Protocol](#-protocol) below.
 
+**3. Run a replicated cluster (Raft)**
+
+Bring up a replicated cluster of `cacheyd` processes with `-consensus raft`.
+The first node creates the cluster; each later node joins it by pointing
+`-join` at any existing member's **client** address (so the cluster can tell it
+who the leader is). Use `-insecure-plaintext` only for local development.
+
+```sh
+# node n1 — creates the cluster
+cacheyd -consensus raft -node-id n1 -client-addr 127.0.0.1:8081 \
+  -raft-addr 127.0.0.1:9101 -data-dir data/n1 -bootstrap -insecure-plaintext
+
+# node n2 — joins it
+cacheyd -consensus raft -node-id n2 -client-addr 127.0.0.1:8082 \
+  -raft-addr 127.0.0.1:9102 -data-dir data/n2 \
+  -join 127.0.0.1:8081 -insecure-plaintext
+```
+
+Every node keeps its own `-data-dir` for the raft log and snapshots. Writes
+commit through the raft leader and replicate to every member, so `cachey`
+works pointed at any node:
+
+```sh
+cachey -insecure-plaintext 127.0.0.1:8081 put user alice  # may redirect to the leader
+cachey -insecure-plaintext 127.0.0.1:8082 get user        # follows the redirect
+```
+
+Restarting a member from its existing `-data-dir` restores its membership;
+pass `-join` again to re-announce a changed client address. (Raft transport is
+plaintext today — node-to-node mTLS is not yet wired into cluster mode.)
+
 <br>
 
 ## 📡 Protocol
@@ -232,7 +267,7 @@ Cachey is built around one question: **how does a single node become a
 distributed cluster?** The layers below show what runs today and where
 the distributed design is headed.
 
-### Single node (`cacheyd`, today)
+### Single node (`cacheyd <addr>`, the default)
 
 ```text
 Client
@@ -245,7 +280,7 @@ Server ──▶ Handler ──▶ Store ──▶ In-memory map
                            WAL  (crash-safe, snapshots + rotation)
 ```
 
-### Raft-replicated store (library, tested)
+### Raft-replicated store (library + `cacheyd` cluster mode)
 
 The same handler serves reads and writes through a **replicated store**
 (`server.ClusterStore`): every mutation is proposed to the raft leader,
@@ -271,7 +306,7 @@ Client ──▶ Handler ──▶ ClusterStore
 | `internal/store` | Storage interface, in-memory store, and replicated FSM |
 | `internal/wal` | Durable log backend for the store, raft log, and pbft log |
 | `pkg/client` | TCP client with `RedirectLeader` for cluster redirects |
-| `cmd/cacheyd` | Runs a single node (`cacheyd <addr> [data-dir]`) |
+| `cmd/cacheyd` | The cacheyd binary: standalone node by default; raft cluster mode via `-consensus raft` |
 
 ### PBFT-replicated store (library, tested)
 
@@ -317,8 +352,9 @@ The roadmap splits two responsibilities:
 - **Sharding** — decides which shard owns a key and spreads load across nodes
 - **Raft** — keeps each shard's replicas consistent (already implemented and tested here)
 
-Next up is wiring `cacheyd` to start and join a Raft group; then keys are
-sharded across groups.
+Next up is wiring PBFT cluster mode through `cacheyd` (a PBFT replica set is
+fixed at startup, so it takes a static peer list rather than bootstrap/join),
+then sharding keys across groups.
 
 <br>
 

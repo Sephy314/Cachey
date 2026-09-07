@@ -116,6 +116,16 @@ func (n *Node) ApplyRecoveredRecord(rec wal.Record) error {
 			}
 		}
 		n.peers = peers
+		// Register the addresses carried by this configuration so a restarted
+		// member remembers how to reach the cluster (mirrors applyConfigLocked,
+		// which does the same on live apply).
+		if pr, ok := n.tr.(PeerRegistrar); ok {
+			for id, addr := range entry.Config.Addrs {
+				if addr != "" {
+					pr.RegisterPeer(id, addr)
+				}
+			}
+		}
 	}
 	n.mu.Unlock()
 	return nil

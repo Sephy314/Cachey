@@ -108,6 +108,19 @@ func (t *TCPTransport) RegisterPeer(id, addr string) {
 	t.peerAddrs[id] = addr
 }
 
+// PeerAddrs returns a copy of the peer address map (ID → host:port). It lets
+// Node.AddServer embed the current membership's addresses in a committed
+// configuration, making it self-describing.
+func (t *TCPTransport) PeerAddrs() map[string]string {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	out := make(map[string]string, len(t.peerAddrs))
+	for k, v := range t.peerAddrs {
+		out[k] = v
+	}
+	return out
+}
+
 // SetNode wires the local raft node that inbound RPCs are dispatched to.
 func (t *TCPTransport) SetNode(n *Node) {
 	t.connMu.Lock()

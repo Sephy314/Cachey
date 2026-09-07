@@ -29,24 +29,84 @@ func main() {
 	var allowClients nameList
 	fs.Var(&allowClients, "allow-client", "client identity (the certificate's DNS SAN) permitted to connect; repeatable (mTLS)")
 	insecure := fs.Bool("insecure-plaintext", false, "serve WITHOUT TLS — development only, never in production")
-	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: cacheyd <address> [data-dir] [flags]\n")
-		fs.PrintDefaults()
-	}
+
+	consensus := fs.String("consensus", "", "cluster consensus engine: \"\" (standalone), \"raft\", or \"pbft\" (not implemented yet)")
+	nodeID := fs.String("node-id", "", "this node's unique id in the cluster (raft cluster)")
+	clientAddr := fs.String("client-addr", "", "client-facing NDJSON listen address, e.g. 127.0.0.1:8081 (raft cluster)")
+	raftAddr := fs.String("raft-addr", "", "raft RPC listen address, e.g. 127.0.0.1:9101 (raft cluster)")
+	dataDir := fs.String("data-dir", "", "data directory for the raft log and snapshots (raft cluster)")
+	bootstrap := fs.Bool("bootstrap", false, "start a brand-new raft cluster as its first node (raft cluster)")
+	join := fs.String("join", "", "client address of an existing member to join or re-announce to (raft cluster)")
+
+	fs.Usage = func() { usage(fs) }
 	fs.Parse(os.Args[1:])
-	args := fs.Args()
-	if len(args) < 1 {
-		fs.Usage()
-		os.Exit(1)
-	}
-	addr := args[0]
-	dir := "data"
-	if len(args) >= 2 {
-		dir = args[1]
-	}
 
 	opts := mTLSOptions(*insecure, *tlsCA, *tlsCert, *tlsKey, allowClients)
 
+	switch *consensus {
+	case "":
+		args := fs.Args()
+		if len(args) < 1 || len(args) > 2 {
+			fs.Usage()
+			os.Exit(1)
+		}
+		if *nodeID != "" || *clientAddr != "" || *raftAddr != "" || *dataDir != "" || *bootstrap || *join != "" {
+			fmt.Fprintln(os.Stderr, "cacheyd: cluster flags require -consensus raft")
+			os.Exit(1)
+		}
+		dir := "data"
+		if len(args) == 2 {
+			dir = args[1]
+		}
+		runStandalone(args[0], dir, opts)
+	case "raft":
+		if len(fs.Args()) != 0 {
+			fmt.Fprintln(os.Stderr, "cacheyd: -consensus raft takes no positional address; use -client-addr")
+			os.Exit(1)
+		}
+		cf := &clusterFlags{
+			nodeID:     *nodeID,
+			clientAddr: *clientAddr,
+			raftAddr:   *raftAddr,
+			dataDir:    *dataDir,
+			bootstrap:  *bootstrap,
+			join:       *join,
+		}
+		if err := runRaftCluster(cf, opts); err != nil {
+			fmt.Fprintln(os.Stderr, "cacheyd:", err)
+			os.Exit(1)
+		}
+	case "pbft":
+		fmt.Fprintln(os.Stderr, "cacheyd: -consensus pbft is not implemented yet; use -consensus raft")
+		os.Exit(1)
+	default:
+		fmt.Fprintf(os.Stderr, "cacheyd: unknown -consensus %q (want \"\", raft or pbft)\n", *consensus)
+		os.Exit(1)
+	}
+}
+
+// usage prints the command's help text.
+func usage(fs *flag.FlagSet) {
+	fmt.Fprintf(fs.Output(), `Cachey server — a distributed key-value cache.
+
+Usage:
+  cacheyd <address> [data-dir] [flags]                        standalone single node
+  cacheyd -consensus raft -node-id N -client-addr A \
+          -raft-addr R -data-dir D (-bootstrap | -join ADDR)  replicated raft cluster
+
+The first cluster node is started with -bootstrap; each later node joins by
+pointing -join at any existing member's client address (ADDR above). Client
+connections are mTLS by default; pass -insecure-plaintext for local
+development without TLS.
+
+Flags:
+`)
+	fs.PrintDefaults()
+}
+
+// runStandalone serves one independent cache node over addr with its WAL in
+// dir (the historical cacheyd behavior).
+func runStandalone(addr, dir string, opts []server.Option) {
 	st := store.NewCacheyStore()
 
 	cfg := wal.DefaultConfig(dir)
@@ -72,7 +132,7 @@ func main() {
 	}
 
 	mode := "mTLS"
-	if *insecure {
+	if len(opts) == 0 {
 		mode = "plaintext (--insecure-plaintext)"
 	}
 	fmt.Printf("Server started on %s (%s) with WAL at %s\n", addr, mode, dir)

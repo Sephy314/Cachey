@@ -106,6 +106,14 @@ type PeerRegistrar interface {
 	RegisterPeer(id, addr string)
 }
 
+// peerAddrSource is implemented by transports that can report the addresses
+// they know for peers. AddServer uses it to embed the current membership's
+// addresses into the committed configuration so the configuration is
+// self-describing (see Configuration.Addrs).
+type peerAddrSource interface {
+	PeerAddrs() map[string]string
+}
+
 // NewNode creates a Raft node. applyFn is called once per committed entry, in
 // order, and must not call back into this node (it runs while the node lock is
 // held). tr delivers RPCs to peers.
@@ -753,8 +761,9 @@ func (n *Node) applyConfigLocked(cfg *Configuration) {
 	}
 	// A leader that removes itself defers the step-down until a final
 	// heartbeat has propagated the committed configuration to the remaining
-	// members (otherwise they never learn the commit index).
-	if n.role == RoleLeader && !n.isVoter(n.id) {
+	// members (otherwise they never learn the commit index). Adding a server
+	// keeps the leader in office (Raft §6); only a self-removal steps it down.
+	if n.role == RoleLeader && n.removed {
 		n.pendingStepDown = true
 	}
 }
@@ -797,9 +806,27 @@ func (n *Node) AddServer(ctx context.Context, id, addr string) error {
 	// new member's address so every node can reach it (see Configuration).
 	voters := append([]string{n.id}, n.peers...)
 	voters = append(voters, id)
-	cfg := &Configuration{Voters: voters}
+	// Ship every current member's transport address (not just the newcomer's)
+	// in the configuration so any node that applies it learns to reach the
+	// whole cluster. Without this a node that joins later never learns earlier
+	// peers' addresses and can never campaign or replicate after a leadership
+	// change. The leader must know every voter's address to replicate to it, so
+	// its transport is the source of truth for the current member set.
+	addrs := map[string]string{}
 	if addr != "" {
-		cfg.Addrs = map[string]string{id: addr}
+		addrs[id] = addr
+	}
+	if src, ok := n.tr.(peerAddrSource); ok {
+		known := src.PeerAddrs()
+		for _, vid := range voters {
+			if a := known[vid]; a != "" {
+				addrs[vid] = a
+			}
+		}
+	}
+	cfg := &Configuration{Voters: voters}
+	if len(addrs) > 0 {
+		cfg.Addrs = addrs
 	}
 	idx, err := n.appendEntryLocked(Entry{Term: n.currentTerm, Config: cfg})
 	n.mu.Unlock()
