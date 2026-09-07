@@ -33,11 +33,10 @@ func main() {
 	consensus := fs.String("consensus", "", "cluster consensus engine: \"\" (standalone) or \"raft\" (pbft/hotstuff not yet)")
 	nodeID := fs.String("node-id", "", "this node's unique id in the cluster (raft cluster)")
 	clientAddr := fs.String("client-addr", "", "client-facing NDJSON listen address, e.g. 127.0.0.1:8081 (raft cluster)")
-	controlAddr := fs.String("control-addr", "", "cluster control-plane (JOIN) listen address, e.g. 127.0.0.1:8082 (raft cluster)")
 	raftAddr := fs.String("raft-addr", "", "raft RPC listen address, e.g. 127.0.0.1:9101 (raft cluster)")
 	dataDir := fs.String("data-dir", "", "data directory for the raft log and snapshots (raft cluster)")
 	bootstrap := fs.Bool("bootstrap", false, "start a brand-new raft cluster as its first node (raft cluster)")
-	join := fs.String("join", "", "client address of an existing member to join or re-announce to (raft cluster)")
+	join := fs.String("join", "", "an existing member to join or re-announce to, as nodeID@raft-addr (raft cluster)")
 
 	fs.Usage = func() { usage(fs) }
 	fs.Parse(os.Args[1:])
@@ -51,7 +50,7 @@ func main() {
 			fs.Usage()
 			os.Exit(1)
 		}
-		if *nodeID != "" || *clientAddr != "" || *controlAddr != "" || *raftAddr != "" || *dataDir != "" || *bootstrap || *join != "" {
+		if *nodeID != "" || *clientAddr != "" || *raftAddr != "" || *dataDir != "" || *bootstrap || *join != "" {
 			fmt.Fprintln(os.Stderr, "cacheyd: cluster flags require -consensus raft")
 			os.Exit(1)
 		}
@@ -70,13 +69,12 @@ func main() {
 			os.Exit(1)
 		}
 		cf := &clusterFlags{
-			nodeID:      *nodeID,
-			clientAddr:  *clientAddr,
-			controlAddr: *controlAddr,
-			raftAddr:    *raftAddr,
-			dataDir:     *dataDir,
-			bootstrap:   *bootstrap,
-			join:        *join,
+			nodeID:     *nodeID,
+			clientAddr: *clientAddr,
+			raftAddr:   *raftAddr,
+			dataDir:    *dataDir,
+			bootstrap:  *bootstrap,
+			join:       *join,
 		}
 		if err := runRaftCluster(cf, tls); err != nil {
 			fmt.Fprintln(os.Stderr, "cacheyd:", err)
@@ -97,15 +95,14 @@ func usage(fs *flag.FlagSet) {
 
 Usage:
   cacheyd <address> [data-dir] [flags]                        standalone single node
-  cacheyd -consensus raft -node-id N -client-addr A -control-addr C \
-          -raft-addr R -data-dir D (-bootstrap | -join ADDR)  replicated raft cluster
+  cacheyd -consensus raft -node-id N -client-addr A -raft-addr R \
+          -data-dir D (-bootstrap | -join ID@ADDR)             replicated raft cluster
 
 The first cluster node is started with -bootstrap; each later node joins by
-pointing -join at any existing member's CONTROL address (C/ADDR above).
-Client connections are mTLS by default; pass -insecure-plaintext for local
-development without TLS. Membership changes (JOIN) are served only on the
-separate control endpoint, never on the client-facing one.
-
+pointing -join at any existing member's node id and raft address
+(ID@R). Client connections are mTLS by default; pass -insecure-plaintext for
+local development without TLS. Membership changes (JOIN) travel over the
+node-to-node raft transport, never the client-facing data plane.
 Flags:
 `)
 	fs.PrintDefaults()
@@ -207,25 +204,7 @@ func dataServerOpts(t *resolvedTLS) []server.Option {
 	return []server.Option{server.WithTLSConfig(cfg)}
 }
 
-// controlServerOpts returns the cluster-control-plane TLS options, or nil in
-// plaintext mode. The control plane (JOIN) admits any certificate signed by
-// the cluster CA whose identity is a valid name — the node role; clients are
-// kept distinct from nodes by naming convention (per-role CAs are the upgrade
-// path, see internal/mtls).
-func controlServerOpts(t *resolvedTLS) []server.Option {
-	if t.insecure {
-		return nil
-	}
-	cfg, err := mtls.Server(t.ca, t.cert, t.key, func(identity string) bool {
-		return mtls.ValidName(identity)
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "cacheyd:", err)
-		os.Exit(1)
-	}
-	return []server.Option{server.WithTLSConfig(cfg)}
-}
-
+// mustReadFile reads path, exiting with a diagnostic on error.
 func mustReadFile(path string) []byte {
 	b, err := os.ReadFile(path)
 	if err != nil {

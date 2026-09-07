@@ -83,23 +83,19 @@ func (n *Node) SetMetaStore(ms MetaStore) {
 
 // AdoptCommittedMeta restores the durable committed membership (persisted on
 // every applied config) into a node that just recovered from disk. Call after
-// log/WAL recovery and before Run. It overrides whatever the (possibly
-// compacted) log replay produced, so a member that restarted after compaction
-// still knows the cluster and its peers' addresses.
+// log/WAL recovery and before Run.
 //
-// The meta is adopted only when it is NOT older than the newest configuration
-// recovered from the WAL (recoveredConfigIndex). A stale meta file — the crash
-// window between a config committing on this node and the meta file write —
-// must not undo a newer committed configuration.
+// The meta is authoritative: it is written synchronously under the node lock
+// when a configuration is applied — and apply only ever runs on COMMITTED
+// entries — so it is exactly this node's committed membership. A configuration
+// entry that exists only in the WAL above the meta's index was never
+// committed-and-applied on this node (an uncommitted tail, or the vanishingly
+// small crash-between-apply-and-meta-write window); it must not drive
+// membership. Without the meta (a legacy data dir) recovery falls back to the
+// WAL-recovered config (see persist.go).
 func (n *Node) AdoptCommittedMeta(m CommittedMeta) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.committedConfig = true
-	if n.recoveredConfigIndex != 0 && m.Index < n.recoveredConfigIndex {
-		n.logf("keeping WAL-recovered committed config (index %d) over stale meta (index %d)",
-			n.recoveredConfigIndex, m.Index)
-		return
-	}
 	var peers []string
 	included := false
 	for _, id := range m.Voters {

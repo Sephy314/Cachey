@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -17,10 +18,12 @@ import (
 // node id —
 //
 //	node ↔ node raft transport: peers pin each other's node-id certificates
+//	                            and JOIN rides this transport (the control plane)
 //	client ↔ server data plane: a cache client (allow-listed, CA-signed) talks
 //	                            to a node's data endpoint, pinning the node id
-//	control plane (JOIN):      a joining node authenticates with its own node
-//	                            certificate against the leader's control endpoint
+//	JOIN identity binding:      the leader binds the sender's certificate
+//	                            identity to the claimed node id — a node cannot
+//	                            join as someone else
 //
 // Replication only succeeds if the node-to-node raft transport admitted the
 // dynamically-joined member over TLS (the pre-membership admission rule), so
@@ -50,13 +53,8 @@ func newTLSNode(t *testing.T, ca *testca.CA, id string, certPEM, keyPEM []byte, 
 		}
 		return ""
 	})
+	rn.Tr.SetControlHandler(NewControlHandler(rn).HandleControl)
 	dcfg, err := mtls.Server(ca.CertPEM(), certPEM, keyPEM, allowClient)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ccfg, err := mtls.Server(ca.CertPEM(), certPEM, keyPEM, func(identity string) bool {
-		return mtls.ValidName(identity) // node role: any CA-signed node cert
-	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,16 +62,11 @@ func newTLSNode(t *testing.T, ca *testca.CA, id string, certPEM, keyPEM []byte, 
 	if err := data.Start(); err != nil {
 		t.Fatalf("data server %s: %v", id, err)
 	}
-	ctl := NewServer("127.0.0.1:0", NewControlHandler(rn.Node, rn.CS, rn.Store), WithTLSConfig(ccfg))
-	if err := ctl.Start(); err != nil {
-		t.Fatalf("control server %s: %v", id, err)
-	}
 	t.Cleanup(func() {
 		data.Stop()
-		ctl.Stop()
 		rn.Stop()
 	})
-	return &testCtlNode{id: id, rn: rn, clientAddr: data.Addr(), controlAddr: ctl.Addr()}
+	return &testCtlNode{id: id, rn: rn, clientAddr: data.Addr()}
 }
 
 // tlsCmd sends cmd over mutual TLS to addr, authenticating as certPEM/keyPEM
@@ -93,50 +86,33 @@ func tlsCmd(t *testing.T, ca *testca.CA, certPEM, keyPEM []byte, addr, serverNam
 }
 
 // registerSelfTLS makes node the leader of its fresh 1-node cluster and writes
-// its client + control addresses into the replicated registry.
+// its own client address into the replicated registry.
 func (c *testCtlNode) registerSelfTLS(t *testing.T) {
 	t.Helper()
 	c.rn.Node.Run()
-	c.waitT(t, c.id+" to lead", 30*time.Second, func() bool { return c.rn.Node.IsLeader() })
-	c.waitT(t, c.id+" to register its addresses", 30*time.Second, func() bool {
-		return c.put(MemberKey(c.id), c.clientAddr) == nil &&
-			c.put(ControlKey(c.id), c.controlAddr) == nil
+	c.waitCond(t, c.id+" to lead", 30*time.Second, func() bool { return c.rn.Node.IsLeader() })
+	c.waitCond(t, c.id+" to register its client address", 30*time.Second, func() bool {
+		return c.put(MemberKey(c.id), c.clientAddr) == nil
 	})
 }
 
-// joinTLS authenticates as this node's own certificate and asks the contact
-// node's CONTROL endpoint to add it, retrying until acknowledged.
-func (c *testCtlNode) joinTLS(t *testing.T, ca *testca.CA, certPEM, keyPEM []byte, contact *testCtlNode) {
-	t.Helper()
-	payload, err := json.Marshal(JoinRequest{
-		Raft:    c.rn.RaftAddr,
-		Client:  c.clientAddr,
-		Control: c.controlAddr,
-	})
+// sendJoinRaw sends a JOIN request with arbitrary fields over the raft
+// transport to peer, returning the raw error (nil if acknowledged). Used to
+// exercise the identity binding on mis-claimed ids.
+func (c *testCtlNode) sendJoinRaw(peer string, req JoinRequest) error {
+	payload, err := json.Marshal(req)
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
-	cmd := protocol.Command{Type: protocol.JOIN, Key: c.id, Val: string(payload)}
-	c.waitT(t, c.id+" to join over mTLS", 60*time.Second, func() bool {
-		_, err := tlsCmd(t, ca, certPEM, keyPEM, contact.controlAddr, contact.id, cmd)
-		return err == nil
-	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err = c.rn.Tr.SendControl(ctx, peer, payload)
+	return err
 }
 
-func (c *testCtlNode) waitT(t *testing.T, what string, timeout time.Duration, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", what)
-}
-
-// TestClusterMTLSEndToEnd: a 2-node raft cluster where node↔node raft, the
-// data plane and the control plane all run over mutual TLS.
+// TestClusterMTLSEndToEnd: a 2-node raft cluster where node↔node raft (with
+// JOIN riding it), the data plane and identity binding all run over mutual
+// TLS.
 func TestClusterMTLSEndToEnd(t *testing.T) {
 	ca, err := testca.NewCA()
 	if err != nil {
@@ -162,19 +138,23 @@ func TestClusterMTLSEndToEnd(t *testing.T) {
 	A.registerSelfTLS(t)
 	B := newTLSNode(t, ca, "b", certB, keyB, allow)
 
-	// b joins through a's CONTROL endpoint, authenticating with its own node
-	// certificate and pinning a's identity.
-	B.joinTLS(t, ca, certB, keyB, A)
+	// b joins through a's raft-transport control channel, authenticating with
+	// its own node certificate and pinning a's identity.
+	B.joinTransport(t, ctlPeer{id: "a", addr: A.rn.RaftAddr})
 	B.rn.Node.Run()
-	B.waitT(t, "b to be caught up with its registered addresses", 60*time.Second, func() bool {
+	B.waitCond(t, "b to be caught up with its registered client address", 60*time.Second, func() bool {
 		if v, err := B.rn.Store.Get(MemberKey("b")); err != nil || *v != B.clientAddr {
-			return false
-		}
-		if v, err := B.rn.Store.Get(ControlKey("b")); err != nil || *v != B.controlAddr {
 			return false
 		}
 		return len(B.rn.Node.Voters()) == 2
 	})
+
+	// Identity binding: b (certificate "b") may not join claiming to be "c" —
+	// the leader must reject the mis-claimed id.
+	B.rn.Tr.RegisterPeer("a", A.rn.RaftAddr)
+	if err := B.sendJoinRaw("a", JoinRequest{ID: "c", Raft: "127.0.0.1:1", Client: "x"}); err == nil {
+		t.Fatal("join claiming a different id (c) with certificate b must be rejected")
+	}
 
 	// A cache client (alice, allow-listed) writes over client↔server mTLS.
 	if _, err := tlsCmd(t, ca, certAlice, keyAlice, A.clientAddr, "a",
@@ -182,7 +162,7 @@ func TestClusterMTLSEndToEnd(t *testing.T) {
 		t.Fatalf("alice PUT over mTLS: %v", err)
 	}
 	// Replication over node↔node mTLS: the write must reach b's FSM.
-	B.waitT(t, "write to replicate to b over node mTLS", 30*time.Second, func() bool {
+	B.waitCond(t, "write to replicate to b over node mTLS", 30*time.Second, func() bool {
 		if v, err := B.rn.Store.Get("user"); err == nil && *v == "alice" {
 			return true
 		}

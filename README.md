@@ -171,23 +171,22 @@ described in [Protocol](#-protocol) below.
 **3. Run a replicated cluster (Raft)**
 
 Bring up a replicated cluster of `cacheyd` processes with `-consensus raft`.
-The first node creates the cluster; each later node joins it by pointing
-`-join` at any existing member's **control** address (`-control-addr`) — the
-dedicated cluster-control endpoint where membership changes (JOIN) happen.
-The client-facing `-client-addr` endpoint only serves cache commands and never
-accepts JOIN, so a cache client cannot mutate membership. Use
-`-insecure-plaintext` only for local development.
+The first node creates the cluster; each later node joins by pointing `-join`
+at any existing member's node id and raft address (`nodeID@raft-addr`).
+Membership changes (JOIN) ride the node-to-node raft transport — the control
+plane — never the client-facing `-client-addr` endpoint, which only serves
+cache commands and never accepts JOIN, so a cache client cannot mutate
+membership. Use `-insecure-plaintext` only for local development.
 
 ```sh
-# node n1 — creates the cluster (client :8081, control :8082, raft :9101)
+# node n1 — creates the cluster (client :8081, raft :9101)
 cacheyd -consensus raft -node-id n1 -client-addr 127.0.0.1:8081 \
-  -control-addr 127.0.0.1:8082 -raft-addr 127.0.0.1:9101 \
-  -data-dir data/n1 -bootstrap -insecure-plaintext
+  -raft-addr 127.0.0.1:9101 -data-dir data/n1 -bootstrap -insecure-plaintext
 
-# node n2 — joins through n1's CONTROL endpoint
+# node n2 — joins through n1's raft transport
 cacheyd -consensus raft -node-id n2 -client-addr 127.0.0.1:8083 \
-  -control-addr 127.0.0.1:8084 -raft-addr 127.0.0.1:9102 \
-  -data-dir data/n2 -join 127.0.0.1:8082 -insecure-plaintext
+  -raft-addr 127.0.0.1:9102 -data-dir data/n2 \
+  -join n1@127.0.0.1:9101 -insecure-plaintext
 ```
 
 Every node keeps its own `-data-dir` for the raft log and snapshots. Writes
@@ -201,25 +200,27 @@ cachey -insecure-plaintext 127.0.0.1:8083 get user        # follows the redirect
 
 Restarting a member from its existing `-data-dir` restores its membership —
 including after snapshots/log compaction, thanks to the durable committed
-configuration; pass `-join` again only to re-announce a changed address.
+configuration (recorded at commit time, so recovery never lets a WAL-only,
+never-applied config drive membership); pass `-join` again only to
+re-announce a changed client address.
 
 **Cluster with mutual TLS.** Cluster mode speaks mTLS on every plane with one
 certificate per node whose DNS SAN is the node id: the node↔node raft
-transport, the client-facing data endpoint, and the control endpoint all use
-it. Cache clients (e.g. `cachey`) get their own CA-signed certificates, which
-the data endpoint admit via `-allow-client`:
+transport (including JOIN, which rides it) and the client-facing data
+endpoint both use it. Cache clients (e.g. `cachey`) get their own CA-signed
+certificates, which the data endpoint admit via `-allow-client`:
 
 ```sh
 # node a (SAN = a) — creates the cluster
 cacheyd -consensus raft -node-id a -client-addr 127.0.0.1:8081 \
-  -control-addr 127.0.0.1:8082 -raft-addr 127.0.0.1:9101 -data-dir data/a \
+  -raft-addr 127.0.0.1:9101 -data-dir data/a \
   -bootstrap -tls-ca ca.pem -tls-cert a.pem -tls-key a-key.pem \
   -allow-client alice
 
-# node b (SAN = b) — joins through a's control endpoint
+# node b (SAN = b) — joins through a's raft transport, authenticating as b
 cacheyd -consensus raft -node-id b -client-addr 127.0.0.1:8083 \
-  -control-addr 127.0.0.1:8084 -raft-addr 127.0.0.1:9102 -data-dir data/b \
-  -join 127.0.0.1:8082 -tls-ca ca.pem -tls-cert b.pem -tls-key b-key.pem \
+  -raft-addr 127.0.0.1:9102 -data-dir data/b \
+  -join a@127.0.0.1:9101 -tls-ca ca.pem -tls-cert b.pem -tls-key b-key.pem \
   -allow-client alice
 
 # cache client alice talks to node a over mTLS (pins server identity = a)
@@ -228,14 +229,16 @@ cachey -tls-ca ca.pem -tls-cert alice.pem -tls-key alice-key.pem \
 ```
 
 Node ids must be valid DNS names (no underscores), since the node mTLS
-certificates carry them as SANs. A node with no committed membership yet (a
-fresh joiner / lone bootstrap) admits any certificate signed by the cluster CA
-so the first membership can form over TLS; once a configuration applies,
-raft-transport admission is restricted to the member set. A `cachey` client
-pins one `-server-name`, so point it at a specific node (typically the
-current leader) — leader redirects hop between data endpoints that present
-different node identities. The separate control endpoint is still where JOIN
-happens (binding it to the raft transport is the remaining mTLS follow-up).
+certificates carry them as SANs. Under mTLS the certificate identity is
+authoritative for membership: when a node joins, the leader binds the sender's
+certificate identity to the claimed node id, so a node cannot join as someone
+else. A node with no committed membership yet (a fresh joiner / lone
+bootstrap) admits any certificate signed by the cluster CA so the first
+membership can form over TLS; raft RPCs, however, are only served to known
+members — a non-member can send control (JOIN) but never raft messages. A
+`cachey` client pins one `-server-name`, so point it at a specific node
+(typically the current leader) — leader redirects hop between data endpoints
+that present different node identities.
 
 <br>
 

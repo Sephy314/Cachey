@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -11,18 +12,25 @@ import (
 	"github.com/Sephy314/Cachey/pkg/client"
 )
 
-// This file pins the control-plane separation (Option A): a raft-cluster node
-// serves JOIN — the only membership-changing operation — on a dedicated
-// CONTROL endpoint, and the client-facing DATA endpoint rejects JOIN and any
-// access to the reserved membership registry. All through the real wire
-// handlers (NewClusterHandler / NewControlHandler) and servers.
+// This file pins the control-plane separation (Option B): a raft-cluster node
+// serves JOIN — the only membership-changing operation — on the node-to-node
+// raft transport (raft.TCPTransport control channel), and the client-facing
+// DATA endpoint rejects JOIN and any access to the reserved membership
+// registry. All through the real wire handlers (NewClusterHandler /
+// NewControlHandler) and transport.
 
-// testCtlNode is a raft-cluster node with both planes listening.
+// testCtlNode is a raft-cluster node with its raft transport (control plane
+// registered) and its client-facing data server listening.
 type testCtlNode struct {
-	id          string
-	rn          *RaftNode
-	clientAddr  string // data plane
-	controlAddr string // control plane (JOIN)
+	id         string
+	rn         *RaftNode
+	clientAddr string // data plane
+}
+
+// ctlPeer identifies a member's raft-transport endpoint for a JOIN.
+type ctlPeer struct {
+	id   string
+	addr string
 }
 
 func newTestCtlNode(t *testing.T, id string) *testCtlNode {
@@ -46,31 +54,26 @@ func newTestCtlNode(t *testing.T, id string) *testCtlNode {
 		}
 		return ""
 	})
+	rn.Tr.SetControlHandler(NewControlHandler(rn).HandleControl)
 	data := NewServer("127.0.0.1:0", NewClusterHandler(rn.CS))
 	if err := data.Start(); err != nil {
 		t.Fatalf("data server %s: %v", id, err)
 	}
-	ctl := NewServer("127.0.0.1:0", NewControlHandler(rn.Node, rn.CS, rn.Store))
-	if err := ctl.Start(); err != nil {
-		t.Fatalf("control server %s: %v", id, err)
-	}
 	t.Cleanup(func() {
 		data.Stop()
-		ctl.Stop()
 		rn.Stop()
 	})
-	return &testCtlNode{id: id, rn: rn, clientAddr: data.Addr(), controlAddr: ctl.Addr()}
+	return &testCtlNode{id: id, rn: rn, clientAddr: data.Addr()}
 }
 
 // bootstrap makes node the leader of a fresh 1-node cluster and registers its
-// own client + control addresses.
+// own client address in the replicated registry.
 func (c *testCtlNode) bootstrap(t *testing.T) {
 	t.Helper()
 	c.rn.Node.Run()
 	c.waitCond(t, c.id+" to lead", 30*time.Second, func() bool { return c.rn.Node.IsLeader() })
-	c.waitCond(t, c.id+" to register its addresses", 30*time.Second, func() bool {
-		return c.put(MemberKey(c.id), c.clientAddr) == nil &&
-			c.put(ControlKey(c.id), c.controlAddr) == nil
+	c.waitCond(t, c.id+" to register its client address", 30*time.Second, func() bool {
+		return c.put(MemberKey(c.id), c.clientAddr) == nil
 	})
 }
 
@@ -102,39 +105,59 @@ func (c *testCtlNode) waitCond(t *testing.T, what string, timeout time.Duration,
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// joinCtl drives the JOIN wire protocol against a member's CONTROL endpoint,
-// following "not leader: <control addr>" redirects until a leader acks.
-func (c *testCtlNode) joinCtl(t *testing.T, contactControl string) {
-	t.Helper()
-	payload, err := json.Marshal(JoinRequest{
-		Raft:    c.rn.RaftAddr,
-		Client:  c.clientAddr,
-		Control: c.controlAddr,
-	})
+// joinReply is the JSON shape of a JOIN control reply: either an ack {"ok":
+// id} or a redirect {"leader": id, "addr": raft-addr}.
+type joinReply struct {
+	OK     string `json:"ok"`
+	Leader string `json:"leader"`
+	Addr   string `json:"addr"`
+}
+
+// sendJoin sends a raw JOIN control message from this node's transport to
+// peer and returns the parsed reply (an ack or a redirect). peer must already
+// be reachable (its address registered in this node's transport).
+func (c *testCtlNode) sendJoin(peer string, req JoinRequest) (*joinReply, error) {
+	payload, err := json.Marshal(req)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
-	cmd := protocol.Command{Type: protocol.JOIN, Key: c.rn.ID, Val: string(payload)}
-	target := contactControl
-	c.waitCond(t, c.id+" to join", 60*time.Second, func() bool {
-		cl, err := client.NewClient(target)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	raw, err := c.rn.Tr.SendControl(ctx, peer, payload)
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+	var res joinReply
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// joinTransport drives the JOIN control message over the raft transport:
+// contact a member, follow "leader/addr" redirects until the leader acks.
+func (c *testCtlNode) joinTransport(t *testing.T, contact ctlPeer) {
+	t.Helper()
+	req := JoinRequest{ID: c.id, Raft: c.rn.RaftAddr, Client: c.clientAddr}
+	target := contact
+	c.waitCond(t, c.id+" to join over the raft transport", 60*time.Second, func() bool {
+		c.rn.Tr.RegisterPeer(target.id, target.addr)
+		res, err := c.sendJoin(target.id, req)
 		if err != nil {
 			return false
 		}
-		_, err = cl.SendCommand(cmd)
-		cl.Close()
-		if err == nil {
+		if res.OK != "" {
 			return true
 		}
-		if next, ok := client.RedirectLeader(err); ok {
-			target = next
+		if res.Leader != "" && res.Addr != "" {
+			target = ctlPeer{id: res.Leader, addr: res.Addr}
 		}
 		return false
 	})
 }
 
-// sendCommand sends one command over plaintext and returns the error (nil on a
-// command echo).
+// sendCommand sends one command over plaintext to a data endpoint and returns
+// the error (nil on a command echo).
 func sendCommand(addr string, cmd protocol.Command) error {
 	cl, err := client.NewClient(addr)
 	if err != nil {
@@ -145,9 +168,17 @@ func sendCommand(addr string, cmd protocol.Command) error {
 	return err
 }
 
-// TestClusterControlPlaneSeparation: JOIN works only on the control endpoint;
-// the data endpoint rejects JOIN and the reserved registry keys; a non-leader
-// control endpoint redirects to the leader's CONTROL address.
+func derefOr(s *string) string {
+	if s == nil {
+		return "<nil>"
+	}
+	return *s
+}
+
+// TestClusterControlPlaneSeparation: JOIN works only over the raft transport
+// (the control plane); the data endpoint rejects JOIN and the reserved
+// registry keys; a non-leader control endpoint redirects to the leader's raft
+// endpoint.
 func TestClusterControlPlaneSeparation(t *testing.T) {
 	A := newTestCtlNode(t, "A")
 	A.bootstrap(t)
@@ -164,50 +195,50 @@ func TestClusterControlPlaneSeparation(t *testing.T) {
 	for _, cmd := range []protocol.Command{
 		{Type: protocol.GET, Key: MemberKey("A")},
 		{Type: protocol.PUT, Key: MemberKey("evil"), Val: "x"},
-		{Type: protocol.GET, Key: ControlKey("A")},
+		{Type: protocol.GET, Key: MemberKey("evil")},
 	} {
 		if err := sendCommand(A.clientAddr, cmd); !errors.As(err, &st) || st.Code != protocol.CodeInvalidArgument {
 			t.Fatalf("%s %s on data endpoint = %v, want InvalidArgument", cmd.Type, cmd.Key, err)
 		}
 	}
 
-	// (3) A JOIN on the CONTROL endpoint adds a real member (via the wire).
+	// (3) A JOIN over the raft transport (control plane) adds a real member.
 	B := newTestCtlNode(t, "B") // raft listening, not yet a member, not running
-	B.joinCtl(t, A.controlAddr)
+	B.joinTransport(t, ctlPeer{id: "A", addr: A.rn.RaftAddr})
 	B.rn.Node.Run()
-	B.waitCond(t, "B to be caught up with its registered addresses", 60*time.Second, func() bool {
+	B.waitCond(t, "B to be caught up with its registered client address", 60*time.Second, func() bool {
 		v, err := B.rn.Store.Get(MemberKey("B"))
 		if err != nil || *v != B.clientAddr {
 			return false
 		}
-		v, err = B.rn.Store.Get(ControlKey("B"))
-		if err != nil || *v != B.controlAddr {
-			return false
-		}
 		return len(B.rn.Node.Voters()) == 2
 	})
-	// The leader's FSM also learned B's control address (registry replicated).
-	if v, err := A.rn.Store.Get(ControlKey("B")); err != nil || *v != B.controlAddr {
-		t.Fatalf("leader does not know B's control address: %v %q", err, derefOr(v))
+	// The leader's FSM also learned B's client address (registry replicated).
+	if v, err := A.rn.Store.Get(MemberKey("B")); err != nil || *v != B.clientAddr {
+		t.Fatalf("leader does not know B's client address: %v %q", err, derefOr(v))
 	}
 
-	// (4) A non-leader's control endpoint redirects to the leader's CONTROL
-	// address, so the joiner retries against the actual leader.
+	// (4) A non-leader's control endpoint redirects to the leader's raft
+	// endpoint, so the joiner retries against the actual leader.
 	B.waitCond(t, "B to learn that A is the leader", 30*time.Second, func() bool {
 		return B.rn.Node.Leader() == "A"
 	})
-	third := JoinRequest{Raft: "127.0.0.1:1", Client: "c", Control: "ctl"}
-	payload, _ := json.Marshal(third)
-	cerr := sendCommand(B.controlAddr, protocol.Command{Type: protocol.JOIN, Key: "C", Val: string(payload)})
-	next, ok := client.RedirectLeader(cerr)
-	if !ok || next != A.controlAddr {
-		t.Fatalf("follower control redirect = (%q, %v), want (%q, true)", next, ok, A.controlAddr)
+	J := newTestCtlNode(t, "J") // fresh joiner, not running, not a member
+	J.rn.Tr.RegisterPeer("B", B.rn.RaftAddr)
+	res, err := J.sendJoin("B", JoinRequest{ID: "J", Raft: "127.0.0.1:1", Client: "c"})
+	if err != nil {
+		t.Fatalf("JOIN to follower = %v, want a redirect reply", err)
 	}
-}
-
-func derefOr(s *string) string {
-	if s == nil {
-		return "<nil>"
+	if res.Leader != "A" || res.Addr != A.rn.RaftAddr {
+		t.Fatalf("follower redirect = {%q %q}, want {%q %q}", res.Leader, res.Addr, "A", A.rn.RaftAddr)
 	}
-	return *s
+	// Following the redirect to the leader completes the JOIN.
+	J.rn.Tr.RegisterPeer(res.Leader, res.Addr)
+	res, err = J.sendJoin("A", JoinRequest{ID: "J", Raft: "127.0.0.1:1", Client: "c"})
+	if err != nil {
+		t.Fatalf("JOIN to leader after redirect = %v, want an ack", err)
+	}
+	if res.OK != "J" {
+		t.Fatalf("leader ack = %q, want J", res.OK)
+	}
 }

@@ -85,20 +85,10 @@ type Node struct {
 	applySnapshotFn   func([]byte) error
 	snapshotThreshold uint64
 	// metaStore persists the committed membership (see meta.go) so a restart
-	// after log compaction still knows the cluster.
+	// after log compaction still knows the cluster. It is written synchronously
+	// when a configuration is applied (= committed on this node), so it is this
+	// node's authoritative committed membership on recovery.
 	metaStore MetaStore
-	// recoveredConfigIndex is the highest raft-log index of a configuration
-	// entry restored from the WAL during recovery. AdoptCommittedMeta compares
-	// against it so a stale durable meta never overwrites a newer committed
-	// configuration recovered from the log.
-	recoveredConfigIndex uint64
-	// committedConfig is true once this node has applied (live, recovered, or
-	// adopted from durable meta) a membership configuration. A node with no
-	// committed config yet — a fresh joiner or a lone bootstrap — has not joined
-	// a cluster, so its transport may admit any CA-signed peer to let the first
-	// membership form over mutual TLS; afterwards admission is restricted to
-	// the member set.
-	committedConfig bool
 
 	// pendingStepDown defers a leader's self-removal until its final heartbeat
 	// has propagated the committed configuration to the remaining members.
@@ -112,7 +102,11 @@ type Node struct {
 	stopOnce      sync.Once
 	stopCh        chan struct{}
 	doneCh        chan struct{}
-	rng           *rand.Rand
+	// started marks that Run() launched the background loops; Stop() only waits
+	// for them when started (a node created but never run — e.g. a fresh joiner
+	// that was removed before the leader added it — must stop without hanging).
+	started bool
+	rng     *rand.Rand
 }
 
 // PeerRegistrar is implemented by transports that can learn new peer addresses
@@ -204,15 +198,24 @@ func (n *Node) replicateSetLocked() []string {
 
 // Run starts the node's background goroutines (election timer, heartbeats).
 func (n *Node) Run() {
+	n.mu.Lock()
+	n.started = true
+	n.mu.Unlock()
 	go n.electionLoop()
 	go n.heartbeatLoop()
 }
 
-// Stop shuts down the node's background goroutines. Safe to call multiple times.
+// Stop shuts down the node's background goroutines. Safe to call multiple
+// times and on a node whose Run was never called.
 func (n *Node) Stop() {
 	n.stopOnce.Do(func() {
 		close(n.stopCh)
-		<-n.doneCh
+		n.mu.Lock()
+		started := n.started
+		n.mu.Unlock()
+		if started {
+			<-n.doneCh
+		}
 	})
 }
 
@@ -241,15 +244,6 @@ func (n *Node) Role() Role {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.role
-}
-
-// CommittedMembership reports whether this node has learned a committed
-// membership configuration (applied live, recovered from the WAL, or adopted
-// from durable meta). A node without one has not joined any cluster yet.
-func (n *Node) CommittedMembership() bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.committedConfig
 }
 
 // ---- background loops ----
@@ -738,7 +732,6 @@ func (n *Node) applyCommittedLocked() {
 // joining members that were promoted to voters). idx is the raft-log index of
 // the applied configuration entry.
 func (n *Node) applyConfigLocked(cfg *Configuration, idx uint64) {
-	n.committedConfig = true
 	// Learn transport addresses of members introduced by this change so we can
 	// reach them even if we later become the leader. Without this, a member
 	// added while another node led is orphaned once leadership moves (the new
