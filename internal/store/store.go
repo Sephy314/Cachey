@@ -209,9 +209,10 @@ func (s *CacheyStore) ApplyRecord(rec wal.Record) error {
 	case wal.OpConfig:
 		// Raft configuration-change entry: handled by the raft node, not the
 		// store. Kept as a no-op so mixed-mode recovery is safe.
-	case wal.OpPBFT:
-		// PBFT consensus-log entry: handled by the PBFT replica, not the store.
-		// Kept as a no-op so a WAL shared with a PBFT replica recovers safely.
+	case wal.OpHotStuff:
+		// Chained HotStuff consensus-log entry: handled by the HotStuff
+		// replica, not the store. Kept as a no-op so a WAL shared with a
+		// HotStuff replica recovers safely.
 	default:
 		return fmt.Errorf("wal: unknown op %q", rec.Op)
 	}

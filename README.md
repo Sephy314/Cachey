@@ -4,7 +4,7 @@
 
 ### A **distributed** key-value cache store, written in Go
 
-*Raft and PBFT consensus. Sharding. Built for the cluster, not just the box.*
+*Raft (CFT) and HotStuff (BFT) consensus. Sharding. Built for the cluster, not just the box.*
 
 `Go 1.26.7` · `Experimental` · [License](LICENSE)
 
@@ -24,10 +24,14 @@ Two consensus engines are implemented and tested end to end:
 - **Raft** (`internal/raft`) — crash-fault-tolerant replication: leader
   election, log replication with WAL-backed durability, dynamic membership,
   linearizable reads, leader redirect, and snapshot/log compaction.
-- **PBFT** (`internal/pbft`) — Byzantine-fault-tolerant replication:
-  normal-case pre-prepare/prepare/commit ordering, Ed25519-authenticated
-  messages, view change with Byzantine-safe prepared certificates, and
-  WAL-backed recovery of the ordered log.
+- **HotStuff** (`internal/hotstuff`) — Byzantine-fault-tolerant replication:
+  Chained HotStuff with a 3-chain commit rule, Ed25519-authenticated messages,
+  view change with quorum-certificate handoff, WAL-backed recovery of accepted
+  blocks/QCs, and a TCP transport + replicated cluster store.
+
+PBFT was replaced by HotStuff as the BFT engine: same $n = 3f + 1$ partial-
+synchrony model, but a leaner chained design (two message kinds, $O(n)$ view
+changes) instead of PBFT's prepare/commit certificate machinery.
 
 The `cacheyd` binary runs both modes: a single standalone node by default, and a
 replicated **Raft cluster** with `-consensus raft` — the first node bootstraps
@@ -41,7 +45,7 @@ sharded across machines).
 | | Area | Status |
 |---|---|---|
 | 🧠 | **Raft consensus** (crash-fault tolerant) | ✅ Implemented — election, replication, membership, linearizable reads, snapshots |
-| 🧠 | **PBFT consensus** (Byzantine-fault tolerant) | ✅ Implemented — normal case, view change, Ed25519 auth, WAL recovery |
+| 🧠 | **HotStuff consensus** (Byzantine-fault tolerant) | ✅ Implemented (library) — chained 3-chain commit, Ed25519 auth, view change, WAL recovery, TCP cluster store |
 | 🔀 | **Sharding** | 🚧 Roadmap — next after `cacheyd` cluster wiring |
 | 🛡️ | **Failure detection & recovery** | ✅ Elections/view changes + failover tested; WAL + snapshot recovery |
 | 🔌 | **Stable client protocol** | ✅ NDJSON protocol + leader-redirect hints |
@@ -49,8 +53,8 @@ sharded across machines).
 > **Note:** the status table reflects what is implemented in this
 > repository today — both consensus *engines*, their integration tests, and
 > the runnable Raft cluster mode through the `cacheyd` binary are complete.
-> PBFT is planned to be replaced by **HotStuff**; cluster mode for it through
-> `cacheyd`, and sharding keys across nodes, remain on the roadmap.
+> HotStuff's `cacheyd` cluster mode (it takes a static peer list at startup,
+> like PBFT did) and sharding keys across nodes remain on the roadmap.
 
 <br>
 
@@ -81,21 +85,21 @@ sharded across machines).
 **Security — mutual TLS** (`internal/mtls`)
 - Client ↔ server mTLS: the cache server requires a client certificate signed
   by a trusted CA and admits only allowlisted identities
-- Node ↔ node mTLS on both the Raft and PBFT transports; each dialer pins the
+- Node ↔ node mTLS on the Raft transport; each dialer pins the
   peer's certificate identity (its DNS SAN) to the expected node id
 - Identity is carried in the certificate SAN, never CN; standard chain +
   hostname verification is always on (no `InsecureSkipVerify`)
 - `cacheyd` defaults to TLS — plaintext requires the explicit
   `--insecure-plaintext` development flag
-**PBFT consensus engine** (`internal/pbft`)
-- Normal-case consensus — pre-prepare / prepare / commit with total order
-- Byzantine fault tolerance — tolerates `f` faulty replicas (`N >= 3f + 1`)
+**HotStuff consensus engine** (`internal/hotstuff`)
+- Chained HotStuff — 2-chain lock / 3-chain commit over a block tree of
+  quorum certificates; tolerates `f` faulty replicas (`N = 3f + 1`)
 - All messages authenticated with Ed25519 signatures; forged/tampered traffic rejected
-- View change / new view with Byzantine-safe prepared certificates
-- WAL-backed persistence of the ordered log; restart recovery
-- Primary-only writes — backups reject with `ErrNotPrimary` and advertise the primary
-- Fault-injection e2e suite: reordering, partitions, equivocation, fake commits,
-  primary silence/view change, duplicate delivery, no conflicting commit at a sequence
+- View change / pacemaker — a quorum of view changes hands the highest QC to the next leader
+- WAL-backed persistence of accepted blocks, QCs, the executed watermark and the
+  vote height; crash recovery never re-executes below the watermark
+- Leader-only writes — followers reject with `ErrNotLeader` and advertise the leader
+- TCP NDJSON transport with identity-key handshake; replicated cluster store e2e suite
 
 **Quality**
 - Unit, integration, and end-to-end tests plus `-race` runs
@@ -297,8 +301,8 @@ When a node is part of a replicated cluster, a write or read sent to a
 non-leader fails with a `14` (`Unavailable`) status that carries the
 current leader's address — the Go client can extract it with
 `client.RedirectLeader(err)` and reconnect automatically. Raft nodes expose
-this redirect over the wire; PBFT stores reject non-primary access with
-`ErrNotPrimary` and advertise the primary through `Leader()`.
+this redirect over the wire; HotStuff stores reject non-leader access with
+`hotstuff.ErrNotLeader` and advertise the leader through `Leader()`.
 
 The Go client in `pkg/client` handles JSON serialization, newline
 framing, and status errors automatically.
@@ -345,35 +349,36 @@ Client ──▶ Handler ──▶ ClusterStore
 |---|---|
 | `internal/protocol` | Defines commands and JSON parsing |
 | `internal/raft` | Consensus core: election, replication, membership, read index, snapshots |
-| `internal/pbft` | BFT consensus core: normal case, view change, Ed25519 auth, WAL recovery |
-| `internal/server` | TCP dispatch; `ClusterStore`/`PbftClusterStore` adapt a node to `store.Store` |
+| `internal/hotstuff` | BFT consensus core: chained blocks, QC, view change, Ed25519 auth, WAL recovery |
+| `internal/server` | TCP dispatch; `ClusterStore`/`HotStuffClusterStore` adapt a node to `store.Store` |
 | `internal/store` | Storage interface, in-memory store, and replicated FSM |
-| `internal/wal` | Durable log backend for the store, raft log, and pbft log |
+| `internal/wal` | Durable log backend for the store, raft log, and hotstuff log |
 | `pkg/client` | TCP client with `RedirectLeader` for cluster redirects |
 | `cmd/cacheyd` | The cacheyd binary: standalone node by default; raft cluster mode via `-consensus raft` |
 
-### PBFT-replicated store (library, tested)
+### HotStuff-replicated store (library, tested)
 
-PBFT is the Byzantine counterpart of the raft store: writes are ordered by
-the view's **primary** through pre-prepare / prepare / commit, executed by
-every replica in sequence, and exposed to clients by
-`server.PbftClusterStore`. Backups reject writes with `pbft.ErrNotPrimary`
-and advertise the primary, and every message is Ed25519-signed so a faulty
-replica cannot equivocate undetected.
+HotStuff is the Byzantine counterpart of the raft store: writes are ordered by
+the view's **leader** into a block chain, executed by every replica in order
+once a 3-chain forms above the command, and exposed to clients by
+`server.HotStuffClusterStore`. Followers reject writes with
+`hotstuff.ErrNotLeader` and advertise the leader, and every message is
+Ed25519-signed so a faulty replica cannot equivocate undetected. Because a
+Chained HotStuff block commits only once two further blocks carry QCs above it,
+ the store's leader flushes empty blocks after each command until it commits.
 
 ```text
-Client ──▶ Handler ──▶ PbftClusterStore
+Client ──▶ Handler ──▶ HotStuffClusterStore
                            │
-                       PBFT Replica ──signed pre-prepare / prepare / commit──▶ peers
+                    HotStuff Replica ──signed proposal / vote──▶ peers
                            │
-                    WAL (ordered log) ──▶ FSM (CacheyStore)
+                  WAL (blocks/QCs/watermark) ──▶ FSM (CacheyStore)
                            │
-                 view change (on primary failure)
+                 view change (on leader failure)
 ```
 
-Fault-injection e2e tests cover Byzantine primaries and backups, view
-changes under primary silence, network partitions, message loss and
-reordering, and duplicate delivery.
+Fault-injection tests cover forged/tampered messages, Byzantine leaders that
+still equivocate authentically, leader failover, and idempotent WAL recovery.
 
 ### Target: sharded cluster (roadmap)
 
@@ -396,9 +401,9 @@ The roadmap splits two responsibilities:
 - **Sharding** — decides which shard owns a key and spreads load across nodes
 - **Raft** — keeps each shard's replicas consistent (already implemented and tested here)
 
-Next up is HotStuff (PBFT is planned to be replaced by it): a HotStuff replica
-set is fixed at startup, so its `cacheyd` mode takes a static peer list rather
-than raft-style bootstrap/join. After that, keys are sharded across groups.
+Next up: a `cacheyd -consensus hotstuff` cluster mode. A HotStuff replica set
+is fixed at startup (no raft-style bootstrap/join), so that mode takes a
+static peer list. After that, keys are sharded across groups.
 
 <br>
 
