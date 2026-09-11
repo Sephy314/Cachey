@@ -55,7 +55,18 @@ type HotStuffNodeConfig struct {
 	// ValidatorKeys is the fixed validator identity configuration. It must
 	// contain cfg.ID and every entry in Peers; Hello only proves possession of
 	// these configured keys and never establishes trust on first connection.
+	// Only PUBLIC keys belong here — the node's private key never leaves its
+	// durable identity file (hsidentity.json).
 	ValidatorKeys map[string]ed25519.PublicKey
+
+	// TLSCA/TLSCert/TLSKey optionally enable mutual TLS on the peer transport:
+	// cert/key identify this node (their DNS SAN must be cfg.ID) and every peer
+	// must present a certificate signed by TLSCA whose SAN is a configured
+	// validator. All three must be set together; leaving them empty keeps the
+	// plaintext transport (tests and local development).
+	TLSCA   []byte
+	TLSCert []byte
+	TLSKey  []byte
 }
 
 // OpenHotStuffNode opens (or recovers) a persistent HotStuff node and returns
@@ -95,6 +106,15 @@ func OpenHotStuffNode(cfg HotStuffNodeConfig) (*HotStuffNode, error) {
 	tr.SetNode(node)
 	if err := tr.SetValidatorKeys(cfg.ValidatorKeys); err != nil {
 		return nil, err
+	}
+	// Mutual TLS on the peer transport before the listener opens: with it, a
+	// connection is only accepted from a validator's own certificate, on top of
+	// the per-message Ed25519 authentication below it.
+	if len(cfg.TLSCA) > 0 || len(cfg.TLSCert) > 0 || len(cfg.TLSKey) > 0 {
+		if len(cfg.TLSCA) == 0 || len(cfg.TLSCert) == 0 || len(cfg.TLSKey) == 0 {
+			return nil, fmt.Errorf("hotstuff node %s: TLSCA, TLSCert and TLSKey must be set together", cfg.ID)
+		}
+		tr.EnableTLS(cfg.TLSCA, cfg.TLSCert, cfg.TLSKey)
 	}
 
 	// 2. Shared WAL recovery: store snapshot first, then every record — store
@@ -155,10 +175,14 @@ func validateHSValidatorKeys(cfg HotStuffNodeConfig, priv ed25519.PrivateKey) er
 	return nil
 }
 
-// Close shuts the node's transport down. The WAL is flushed by its owner
-// (call w.Close() explicitly before reopening the dir — tests and the server
-// do this; see wal_persist_test / raftnode usage).
-func (n *HotStuffNode) Close() { n.Tr.Close() }
+// Close shuts the node's transport down and stops the replica's background
+// timers (the view-suspicion timer, when armed). The WAL is flushed by its
+// owner (call w.Close() explicitly before reopening the dir — tests and the
+// server do this; see wal_persist_test / raftnode usage).
+func (n *HotStuffNode) Close() {
+	n.Tr.Close()
+	n.Node.Stop()
+}
 
 // newHSStoreApply builds the durable apply hook for a persistent node. Unlike
 // the in-memory NewHotStuffApply, it durably appends each executed mutation to
@@ -210,7 +234,10 @@ type hsIdentityFile struct {
 
 // loadHSIdentity loads the node's private key from dir, generating and
 // persisting a fresh one on first boot. It refuses a file that belongs to a
-// different node id (misconfigured data dir).
+// different node id (misconfigured data dir), and refuses to mint a new key in
+// a directory that already holds state: a lost identity file would otherwise
+// silently rotate the node's public key and invalidate every past QC
+// signature, which is worse than failing loudly.
 func loadHSIdentity(dir, id string) (ed25519.PrivateKey, error) {
 	path := filepath.Join(dir, hsIdentityFileName)
 	b, err := os.ReadFile(path)
@@ -230,6 +257,9 @@ func loadHSIdentity(dir, id string) (ed25519.PrivateKey, error) {
 	}
 	if !os.IsNotExist(err) {
 		return nil, err
+	}
+	if entries, derr := os.ReadDir(dir); derr == nil && len(entries) > 0 {
+		return nil, fmt.Errorf("hotstuff node %s: %s is missing but the data dir is not empty; refusing to generate a new identity", id, hsIdentityFileName)
 	}
 	_, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {

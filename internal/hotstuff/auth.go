@@ -150,6 +150,14 @@ func (n *Replica) qcValid(qc *QC) bool {
 	if len(qc.Votes) < 2*n.f+1 {
 		return false
 	}
+	// A QC's height claim must agree with the block it certifies when that
+	// block is known. A QC carries no view of its own — the view is a property
+	// of the block it certifies, which the structural checks pin (`NodeID` must
+	// be the proposal's parent) — so a height disagreement is the remaining way
+	// a QC could describe something other than the block it names.
+	if b, ok := n.blocks[qc.NodeID]; ok && b.Height != qc.Height {
+		return false
+	}
 	for voter, sig := range qc.Votes {
 		if !n.members[voter] {
 			return false // a non-validator can never contribute to a quorum

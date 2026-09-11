@@ -178,10 +178,10 @@ func (n *Replica) adoptBaseLocked(high *QC) *Fetch {
 			}
 			n.wantBase = high
 			n.baseFrom = from
-			if n.fetches[high.NodeID] {
+			if n.fetchInFlightLocked(high.NodeID) {
 				return nil
 			}
-			n.fetches[high.NodeID] = true
+			n.markFetchLocked(high.NodeID)
 			return &Fetch{BlockID: high.NodeID, To: from}
 		}
 		n.qcHigh = high
@@ -230,6 +230,40 @@ func (n *Replica) completeBaseLocked(id string) {
 	n.activateWithBaseLocked(n.qcHigh)
 }
 
+// fetchTTL bounds how long a Fetch counts as outstanding. Without an expiry a
+// request lost while a peer was unreachable would keep the block "already
+// requested" forever, so the replica could neither ask again nor accept a late
+// answer — it would be stuck until a restart. With it, the next proposal that
+// misses the block simply requests it again.
+const fetchTTL = 2 * time.Second
+
+// pruneFetchThreshold is the in-flight fetch count above which expired entries
+// are swept on the next fetch.
+const pruneFetchThreshold = 1024
+
+// fetchInFlightLocked reports whether a Fetch for id was sent recently enough
+// to still be outstanding. Must hold n.mu.
+func (n *Replica) fetchInFlightLocked(id string) bool {
+	ts, ok := n.fetches[id]
+	return ok && time.Since(ts) < fetchTTL
+}
+
+// markFetchLocked records that a Fetch for id has just been sent. Expired
+// entries are pruned once the set grows, so a long-lived replica that keeps
+// asking for blocks it never receives cannot accumulate them without bound.
+// Must hold n.mu.
+func (n *Replica) markFetchLocked(id string) {
+	now := time.Now()
+	if len(n.fetches) > pruneFetchThreshold {
+		for k, ts := range n.fetches {
+			if now.Sub(ts) >= fetchTTL {
+				delete(n.fetches, k)
+			}
+		}
+	}
+	n.fetches[id] = now
+}
+
 // HandleFetch answers a peer's request for a block this replica holds, signing
 // the reply so the requester can authenticate it.
 func (n *Replica) HandleFetch(f *Fetch) {
@@ -251,6 +285,13 @@ func (n *Replica) HandleFetch(f *Fetch) {
 // own parent is unknown it is parked (and its parent requested); otherwise it
 // is inserted, which also unblocks any proposals and parked blocks waiting on
 // it — a partitioned replica catches up by pulling ancestors bottom-up.
+//
+// A BlockMsg is admitted only as the ANSWER to a fetch this replica actually
+// asked for, and only with the same structural evidence a proposal carries (a
+// genuine QC certifying its direct parent at a lower height). Both matter:
+// Justify is not covered by the content-derived block id, so an unsolicited or
+// unstaked block would let any member inject a fabricated block into the tree
+// and move the head.
 func (n *Replica) HandleBlock(bm *BlockMsg) {
 	if bm == nil || !n.members[bm.From] {
 		return
@@ -264,7 +305,9 @@ func (n *Replica) HandleBlock(bm *BlockMsg) {
 	}
 	b := bm.Block
 	if b.ID == blockID(b.View, b.Height, b.Parent, b.Cmd) && n.blocks[b.ID] == nil &&
-		b.Height > n.blocks[n.bExec].Height {
+		b.Height > n.blocks[n.bExec].Height && n.fetchInFlightLocked(b.ID) &&
+		b.Justify != nil && n.qcValid(b.Justify) &&
+		b.Justify.NodeID == b.Parent && b.Height > b.Justify.Height {
 		if b.Parent != "" && n.blocks[b.Parent] == nil {
 			n.pendingBlocks[b.Parent] = append(n.pendingBlocks[b.Parent], b)
 			needParent = b.Parent // fetch ancestors bottom-up
@@ -285,11 +328,11 @@ func (n *Replica) HandleBlock(bm *BlockMsg) {
 // in-flight set). Sends outside the lock.
 func (n *Replica) requestBlock(peer, id string) {
 	n.mu.Lock()
-	if n.blocks[id] != nil || n.fetches[id] {
+	if n.blocks[id] != nil || n.fetchInFlightLocked(id) {
 		n.mu.Unlock()
 		return
 	}
-	n.fetches[id] = true
+	n.markFetchLocked(id)
 	n.mu.Unlock()
 	n.sendFetch(&Fetch{BlockID: id, To: peer})
 }

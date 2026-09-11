@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
 
 // Errors returned by the replica API.
@@ -102,9 +103,9 @@ type Replica struct {
 	// HS-M2 view change state.
 	vcs      map[uint64]map[string]*ViewChange // view changes per target view, per sender
 	vcSent   map[uint64]bool
-	wantBase *QC             // adopted high QC whose certified block is not yet in the tree
-	baseFrom string          // peer to fetch the base block from
-	fetches  map[string]bool // block ids with a fetch already in flight
+	wantBase *QC                  // adopted high QC whose certified block is not yet in the tree
+	baseFrom string               // peer to fetch the base block from
+	fetches  map[string]time.Time // block ids with a fetch in flight, and when it was sent
 
 	// HS-M4 durable persistence.
 	logStore    LogStore // nil = in-memory only (tests)
@@ -200,7 +201,7 @@ func NewReplica(cfg Config, tr Transport, applyFn func(Block)) (*Replica, error)
 		applied:       map[string]bool{},
 		vcs:           map[uint64]map[string]*ViewChange{},
 		vcSent:        map[uint64]bool{},
-		fetches:       map[string]bool{},
+		fetches:       map[string]time.Time{},
 		stopCh:        make(chan struct{}),
 	}, nil
 }
@@ -372,10 +373,10 @@ func (n *Replica) handleProposalLocked(p *Proposal) (*Vote, []*Proposal, *Fetch)
 		// The parent has not been delivered yet — buffer the proposal and, if
 		// no fetch is in flight for it, ask the proposer to send the block.
 		n.pending[b.Parent] = append(n.pending[b.Parent], p)
-		if n.fetches[b.Parent] {
+		if n.fetchInFlightLocked(b.Parent) {
 			return nil, nil, nil // already requested
 		}
-		n.fetches[b.Parent] = true
+		n.markFetchLocked(b.Parent)
 		return nil, nil, &Fetch{BlockID: b.Parent, To: p.From}
 	}
 	parent := n.blocks[b.Parent]
@@ -600,6 +601,7 @@ func (n *Replica) markAppliedLocked(id string) {
 	n.applied[id] = true
 	if ch := n.notify[id]; ch != nil {
 		close(ch)
+		delete(n.notify, id) // the waiter has been woken; WaitCommitted short-circuits on applied
 	}
 }
 

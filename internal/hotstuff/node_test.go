@@ -71,8 +71,9 @@ func signVote(voter string, h uint64, nodeID string) *Vote {
 // recorderTransport captures the votes a replica sends (to the phantom leader)
 // and drops proposals.
 type recorderTransport struct {
-	mu    sync.Mutex
-	votes []Vote
+	mu       sync.Mutex
+	votes    []Vote
+	fetchIDs []string
 }
 
 func (r *recorderTransport) SendProposal(context.Context, string, *Proposal) error { return nil }
@@ -83,8 +84,13 @@ func (r *recorderTransport) SendVote(_ context.Context, _ string, v *Vote) error
 	return nil
 }
 func (r *recorderTransport) SendViewChange(context.Context, string, *ViewChange) error { return nil }
-func (r *recorderTransport) SendFetch(context.Context, string, *Fetch) error           { return nil }
-func (r *recorderTransport) SendBlock(context.Context, string, *BlockMsg) error        { return nil }
+func (r *recorderTransport) SendFetch(_ context.Context, _ string, f *Fetch) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fetchIDs = append(r.fetchIDs, f.BlockID)
+	return nil
+}
+func (r *recorderTransport) SendBlock(context.Context, string, *BlockMsg) error { return nil }
 
 func (r *recorderTransport) voteCount(nodeID string) int {
 	r.mu.Lock()
