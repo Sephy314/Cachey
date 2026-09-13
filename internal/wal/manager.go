@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -34,6 +35,11 @@ type Manager struct {
 
 	nextID   ControlID
 	rotating bool
+
+	// rotateMu serializes rotation cycles between the background manager and
+	// an explicit WAL.Rotate() (the HotStuff node drives compaction on demand;
+	// the two must never run a cycle concurrently).
+	rotateMu sync.Mutex
 
 	// disableRotation suppresses the rotation manager (raft-log mode).
 	disableRotation bool
@@ -92,12 +98,25 @@ func (m *Manager) tick() {
 	if m.disableRotation {
 		return
 	}
+	m.rotateMu.Lock()
+	defer m.rotateMu.Unlock()
 	if m.rotating || m.writer.MetaCount() < m.threshold {
 		return
 	}
 	m.rotating = true
 	m.rotateWithRetry()
 	m.rotating = false
+}
+
+// Rotate forces one sealing/snapshot/rotation cycle now, independent of the
+// background threshold. It is used by the HotStuff node to compact the shared
+// WAL after the engine checkpoint is durable. Safe to call concurrently with
+// the background manager (serialized by rotateMu); unlike the background
+// path it returns the error instead of calling onFatal.
+func (m *Manager) Rotate() error {
+	m.rotateMu.Lock()
+	defer m.rotateMu.Unlock()
+	return m.rotateOnce()
 }
 
 // rotateWithRetry runs one full rotation, retrying with exponential backoff.

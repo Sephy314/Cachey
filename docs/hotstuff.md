@@ -1,350 +1,510 @@
-# PBFT → Chained HotStuff 전환 기획서
+# PBFT → Chained HotStuff Migration Design
 
-> 상태: **v6 — HS-M1~HS-M5 구현 완료** (`internal/hotstuff/` + `internal/server` 라이브러리
-> 통합, race 클린, PBFT 삭제). `cacheyd -consensus hotstuff` wiring(실행 제품 연결)은
-> 후순위 — M5는 "코어 통합"까지가 완료 범위.
-> 기준: Yin, Malkhi, Reiter, Golan-Gueta, Abraham, *"HotStuff: BFT Consensus with
-> Linearity and Responsiveness"* (PODC '19), arXiv:1803.05069. 체인 규칙/커밋·락
-> 규칙/투표 규칙은 위 논문 §5(Chained), §6(Event-driven Implementation, Alg. 4/6),
-> Appendix B(구현 의사코드 안전성 증명) 기준으로 고정한다.
+> Status: **v7 — HS-M1…HS-M5 implemented, Phase 1 hardening complete**
+> (`internal/hotstuff/` + the `internal/server` integration; race-clean; PBFT removed).
+> `cacheyd -consensus hotstuff` wiring (the runnable binary) is deferred — M5's
+> completed scope is "core integration".
+> Basis: Yin, Malkhi, Reiter, Golan-Gueta, Abraham, *"HotStuff: BFT Consensus with
+> Linearity and Responsiveness"* (PODC '19), arXiv:1803.05069. The chain rules,
+> commit/lock rules and vote rules are pinned to that paper's §5 (Chained), §6
+> (Event-driven Implementation, Alg. 4/6) and Appendix B (implementation
+> pseudocode and safety proof).
 >
-> v6.1 보안 리뷰 반영 (두 차례 리뷰의 P0/P1/P2 모두 처리):
-> - **뷰 점프 쿼럼 게이트**: 단일 vc/제안으로 미래 뷰로 점프 금지 — `maybeActivateLocked`가
->   2f+1 vc 확인 후에만 `enterViewLocked` (HandleViewChange에서 선점프 제거).
-> - **투표 높이 검증**: `voteForBlockLocked`가 `v.Height == 블록.Height` 강제 — 잘못된
->   높이의 정상 서명 투표가 vote set을 오염/영구 wedge하는 것 차단.
-> - **genesis QC 신뢰 강화**: `qcValid`가 genesis QC를 `NodeID==genesis && Height==0`일 때만
->   신뢰 — 위조 "genesis QC" 높이 팽창 거부.
-> - **투표 durable 게이트**: pkVoted 영속화 실패 시 투표를 보내지 않음(재시작 후 같은 높이
->   재투표로 QC 유일성 붕괴 방지). block/qc/watermark는 best-effort 유지.
-> - **FSM 영속 복구(P0)**: `server.OpenHotStuffNode` — store FSM과 엔진이 한 WAL 공유,
->   영속 applyFn이 커밋된 각 mutation을 store record(OpPut 등)로 WAL에 별도 기록 →
->   재시작 시 FSM을 그 record들로 재구성(엔진은 watermark 아래 재실행 안 함). 재시작 테스트
->   `TestHotStuffPersistentRestart`로 데이터 생존 검증.
-> - **신원/키 핀 영속(P0)**: 노드 개인키를 디스크에 영속(`hsidentity.json`, `Config.PrivateKey`
->   주입) — 재시작 후에도 공개키 안정, 과거 QC 서명 검증 유지. validator 공개키는
->   `HotStuffNodeConfig.ValidatorKeys`로 listener 시작 전에 고정하며 Hello는 해당 키의
->   소유만 증명한다(TOFU 없음). 기존 핀과 다른 키는 연결 거부하고 핀은 `hspeers.json`에 영속.
-> - **transport Close**: `stopCh` 닫고 accept loop가 `net.ErrClosed`로 종료(busy-loop 방지).
-> - **store flush 보정**: Chained HotStuff는 팔로워가 리더보다 한 블록 늦게 커밋 → 스토어
->   `propose()`가 리더 커밋 후 빈 블록 하나를 추가 flush해 팔로워가 최종 QC를 접도록 함.
+> v7 (Phase 1 hardening — transport security, identity lifecycle, validation):
+> - **mTLS transport**: `TCPTransport.EnableTLS(ca, cert, key)` wraps the listener
+>   in `mtls.Server` (TLS 1.3, `RequireAndVerifyClientCert`, CA chain check) and
+>   dials through `mtls.Client` with `ServerName` = the peer's node id, so a
+>   certificate from another CA or for another name is refused. The listener's
+>   accept predicate admits only configured validator identities.
+> - **Two identity layers, neither replacing the other**: mTLS authenticates the
+>   *transport* peer (certificate DNS SAN = node id); Ed25519 authenticates the
+>   *consensus* sender (Hello key + per-message signatures). `exchangeHello`
+>   additionally requires `mtls.PeerIdentity(conn) == Hello.ID`, so transport and
+>   consensus identity cannot disagree. The consensus key and the TLS key are
+>   always distinct keypairs bound to the same node id.
+> - **Fetch-response validation (P0)**: `HandleBlock` now admits a `BlockMsg` only
+>   (a) as the answer to a fetch this replica actually issued (TTL-bounded
+>   `fetches` set) and (b) when it carries the same structural evidence a proposal
+>   must (`Justify` is a genuine QC, `Justify.NodeID == Parent`,
+>   `Height > Justify.Height`). `Justify` is not covered by the content-derived
+>   block id, so without both gates any member could inject fabricated blocks into
+>   the tree and move the head. The fetch TTL also removes a permanent stall: a
+>   request lost while a peer was unreachable could otherwise never be re-issued.
+> - **QC height agreement**: `qcValid` rejects a QC whose claimed height disagrees
+>   with the block it certifies, when that block is known locally.
+> - **Wire/message hardening**: `readWireLine` enforces a 4 MiB limit *before* the
+>   reader blocks again (a `ReadSlice`-only check waits forever for a delimiter),
+>   the Hello exchange runs under a read deadline (a peer that never introduces
+>   itself cannot pin a goroutine), `Close` also drops accepted inbound
+>   connections (read loops would otherwise leak a goroutine and a socket each),
+>   and `ConnectPeers` skips a peer that is still down instead of aborting the
+>   whole mesh exchange.
+> - **Lock order fixed**: `connMu` is always taken before `pc.mu` (`peerConn`
+>   dials and runs the Hello handshake without holding `pc.mu`), removing the
+>   ABBA deadlock between `Close` and a sender that held `pc.mu`.
+> - **Identity lifecycle**: `hsidentity.json` is still the durable Ed25519
+>   identity, but a missing identity file in a **non-empty** data directory is now
+>   an error instead of a silent key rotation (a rotated key invalidates every
+>   signature in past QCs). `HotStuffNodeConfig` carries only public keys; TLS
+>   material is optional and must be supplied as a complete set.
+> - **Phase 1 test suites**: mTLS identity enforcement, transport faults
+>   (partition, peer restart, dead/rogue peers, oversized frames), vote/QC
+>   validation regressions, Byzantine equivocation (in-memory and over real mTLS
+>   TCP), crash recovery (QC base, held vote, higher-view rejoin), node rejoin,
+>   identity persistence, and a concurrent send/flap/`Close` guard.
 >
-> v2 변경: (1) commit rule을 §4.2/4.3에서 정밀 고정(부모/justify 기반 판정,
-> 작업 예시 포함). (2) HS-M1에 인증/암호 미포함 명시 + 안전/활성 테스트 분리.
-> (3) Core/Transport/Auth/WAL 계층 분리 명시. (4) HotStuff 고유 상태 모델
-> (PBFT 단계 재사용 금지) 명시. (5) 안전/활성 별도 개념 테스트. (6) 멤버십 고정.
-> (7) 코드 레벨 불변식(§4.8) 추가.
+> v6.1 security-review follow-ups (all P0/P1/P2 from two review rounds):
+> - **Quorum-gated view progress**: no jump to a future view from a single vc or
+>   proposal — `maybeActivateLocked` enters a view only after 2f+1 view changes
+>   (the pre-jump in `HandleViewChange` is gone).
+> - **Vote height validation**: `voteForBlockLocked` requires `v.Height == block.Height`
+>   — a correctly signed vote at the wrong height can no longer pollute the vote set
+>   and permanently wedge the block's QC.
+> - **Stronger genesis trust**: `qcValid` trusts a genesis QC only when
+>   `NodeID==genesis && Height==0` — a forged "genesis QC" inflating the height is
+>   rejected.
+> - **Durable vote gate**: a failed pkVoted write suppresses the vote (a restart
+>   must never re-vote at the same height, which would break QC uniqueness).
+>   block/qc/watermark persistence stays best-effort.
+> - **FSM persistence/recovery (P0)**: `server.OpenHotStuffNode` shares one WAL
+>   between the store FSM and the engine; the durable applyFn appends each committed
+>   mutation as its own store record (OpPut, …) → a restart rebuilds the FSM from
+>   those records while the engine never re-executes below its watermark. Data
+>   survival is pinned by `TestHotStuffPersistentRestart`.
+> - **Identity/key-pin persistence (P0)**: the node's private key is persisted
+>   (`hsidentity.json`, injected as `Config.PrivateKey`) so the public key is stable
+>   across restarts and past QC signatures keep verifying. Validator public keys are
+>   fixed before the listener opens (`HotStuffNodeConfig.ValidatorKeys`); Hello only
+>   proves possession of the configured key (no TOFU). A different key for an
+>   existing pin is refused, and pins persist to `hspeers.json`.
+> - **Transport Close**: closes `stopCh` and lets the accept loop exit on
+>   `net.ErrClosed` (no busy-loop).
+> - **Store flush correction**: Chained HotStuff followers commit one block behind
+>   the leader → the store's `propose()` flushes one extra empty block after the
+>   leader commits so followers fold the final QC.
+>
+> v2 changes: (1) the commit rule is precisely pinned in §4.2/4.3 (parent/justify
+> based, with a worked example). (2) HS-M1 explicitly excludes authentication and
+> cryptography, and safety/liveness tests are separated. (3) The
+> Core/Transport/Auth/WAL layering is made explicit. (4) HotStuff's own state model
+> is specified (PBFT phases are not reused). (5) Safety and liveness are separate
+> conceptual tests. (6) Fixed membership. (7) Code-level invariants (§4.8) added.
 
-## 1. 배경 & 목적
+## 1. Background & Goals
 
-- 현재 Cachey는 두 합의 엔진을 가진다: `internal/raft`(CFT)와 `internal/pbft`(BFT).
-- BFT 엔진을 **PBFT 대신 Chained HotStuff**로 교체한다.
-  - PBFT는 안정 리더 가정하 2 RTT/결정이지만 리더 교체(view-change) 시 통신이
-    $O(n^3)$이고 구현이 복잡·버그에 취약하다(준비 인증서, 체크포인트, 상태 전송…).
-  - Chained HotStuff는 동일한 $n=3f+1$ 부분 동기 모델에서 **두 가지 메시지 타입**
-    (proposal / vote)과 **3-chain 커밋 규칙**만으로 안전성을 얻고, 리더 교체가
-    정상 경로와 동일한 $O(n)$ 비용이다. 뷰 동기화(pacemaker)가 단순하다.
-  - PBFT의 자체 leader-election 부재(정렬된 멤버셋에 `p = view % N`), Ed25519 메시지
-    인증, WAL 영속화, store 통합(`PbftClusterStore`)이라는 검증된 골격은 그대로
-    이어받는다.
+- Cachey currently has two consensus engines: `internal/raft` (CFT) and
+  `internal/pbft` (BFT).
+- The BFT engine is replaced by **Chained HotStuff instead of PBFT**.
+  - PBFT is 2 RTT/decision under an honest stable leader, but leader replacement
+    (view-change) costs $O(n^3)$ messages and the implementation is complex and
+    bug-prone (prepared certificates, checkpoints, state transfer…).
+  - Chained HotStuff achieves safety in the same $n=3f+1$ partial-synchrony model
+    with **two message types** (proposal / vote) and the **3-chain commit rule**
+    alone, and leader replacement costs the same $O(n)$ as the normal path. The
+    pacemaker (view synchronization) is simple.
+  - PBFT's proven skeleton is carried over: no bespoke leader election (a
+    deterministic `p = view % N` over the sorted member set), Ed25519 message
+    authentication, WAL persistence and store integration
+    (`PbftClusterStore`).
 
-## 2. 두 엔진의 포지셔닝 (설계 철학)
+## 2. Positioning of the Two Engines (design philosophy)
 
-| | **Raft** (`internal/raft`) | **HotStuff** (`internal/hotstuff`, 신규) |
+| | **Raft** (`internal/raft`) | **HotStuff** (`internal/hotstuff`, new) |
 |---|---|---|
-| 장애 모델 | CFT (crash) | BFT (byzantine, 최대 $f$, $n=3f+1$) |
-| 결정 지연 | ~2 메시지 왕복 (leader→log) | 3-chain: 제안 후 3개 QC가 쌓여야 커밋 (의도적으로 느림) |
-| 리더 | 선거로 선출, 안정적 | 높이(뷰) 단위로 교체, 타임아웃 시 동기화(회전) |
-| 통신 (리더 교체) | $O(n)$ log | 정상/교체 모두 $O(n)$ |
-| 용도 | 가볍고 싸게 — 신뢰 가능한 소규모/저지연 | 느리고 안정적 — 적대적 환경, 안전 우선 |
+| Fault model | CFT (crash) | BFT (byzantine, up to $f$, $n=3f+1$) |
+| Decision latency | ~2 message round trips (leader→log) | 3-chain: three QCs must accumulate after a proposal (deliberately slow) |
+| Leader | elected, stable | rotates per height (view), resynchronized on timeout |
+| Communication (leader change) | $O(n)$ log | $O(n)$ on both the normal and the replacement path |
+| Purpose | light and cheap — trusted small-scale/low-latency | slow and stable — adversarial environments, safety first |
 
-- HotStuff는 **느리고 안정적이게** 설계: 커밋에 3-chain을 요구하고, 의심/타임아웃
-  기반으로만 리더를 바꾸며, 안전 규칙을 절대 타협하지 않는다. 성능 튜닝(블록 배칭,
-  threshold signature)은 의도적으로 후순위.
-- Raft는 기존 그대로 두고 건드리지 않는다(가볍고 싸게 유지).
+- HotStuff is designed to be **slow and stable**: commits require a 3-chain,
+  leaders change only on suspicion/timeout, and the safety rules are never
+  compromised. Performance tuning (block batching, threshold signatures) is
+  deliberately deferred.
+- Raft is left exactly as it is (kept light and cheap).
 
-## 3. 시스템 모델
+## 3. System Model
 
-- $n = 3f+1$ 고정 멤버(단독 1, 4, 7, …). 리더 포함 최대 $f$개의 Byzantine.
-- 부분 동기: GST 후 유계 지연 $\Delta$. 안전은 항상, 활성(liveness)은 GST 후.
-- 메시지 인증: 리더 제안/부분 투표를 Ed25519로 서명 (PBFT M3 방식 계승).
-- 키 분배: validator 공개키는 클러스터 구성에서 사전 고정하고, Hello는 그 키의 소유만
-  확인한다. 최초 수신 TOFU는 validator 신원에 사용하지 않는다.
-- 리더: 정렬된 멤버셋에 대해 결정적 라운드-로빈. 현재 리더가 진행(progress)하면
-  유임(§6 pacemaker의 "incumbent leader chaining"), 타임아웃 시 다음 리더로 동기화.
-- 클라이언트 쓰기는 현재 리더(primary)로만; 비리더는 `ErrNotLeader` + 리다이렉트 힌트.
+- Fixed membership of $n = 3f+1$ (1, 4, 7, …). Up to $f$ Byzantine replicas,
+  including the leader.
+- Partial synchrony: bounded delay $\Delta$ after GST. Safety always, liveness
+  after GST.
+- Message authentication: leader proposals, votes, view changes and block
+  replies are Ed25519-signed (the PBFT M3 approach). Authentication is layered —
+  see below.
+- Key distribution: validator public keys are fixed as part of the cluster
+  configuration, and Hello only proves possession of that key. Trust on first
+  receive is never used to establish a validator identity.
+- Transport authentication (Phase 1): the peer transport runs under mutual TLS so
+  connections are only accepted from a validator's own certificate (DNS SAN = node
+  id), on top of — never instead of — the Ed25519 consensus signatures. The
+  consensus key and the TLS key are separate keypairs for the same node id.
+- Leader: deterministic round-robin over the sorted member set. An incumbent leader
+  that keeps making progress stays (§6 pacemaker's "incumbent leader chaining");
+  on timeout the cluster resynchronizes to the next leader.
+- Client writes go to the current leader (primary) only; non-leaders return
+  `ErrNotLeader` plus a redirect hint.
 
-## 4. Chained HotStuff 프로토콜 (구현 기준)
+## 4. Chained HotStuff Protocol (implementation reference)
 
-### 4.1 블록/QC
+### 4.1 Blocks and QCs
 
-- **블록** $b$: `(height, cmd, parent, justify)`.
-  - `height`: 단조 증가. `parent`: 블록 트리에서 부모(해시/포인터).
-  - `cmd`: 실행할 클라이언트 커맨드 (캐시 쓰기 1건 = 블록 1개; 배칭은 후순위).
-  - `justify`: 이 블록이 지니는 QC(부모 방향의 조상 블록을 증명).
-- **QC (quorum certificate)**: 특정 (height, 블록 다이제스트)에 대한 $2f+1$개 서로 다른
-  부분 서명(투표) 집합. threshold signature 라이브러리는 쓰지 않고 개별 서명을 나열·
-  검증한다(신규 의존성 없음, PBFT와 동일 접근). QC 크기는 $O(n)$ — 후순위 최적화 대상.
-- **genesis** $b_0$: 자기 자신을 가리키는 하드코딩 QC 포함. 초기 `b_exec = b_lock = b_leaf =
-  b_0`, `qc_high` = $b_0$의 QC.
-- 트리 보관: 부모/justify 링크로 블록 트리 유지. 결손 조상은 다이제스트로 피어에게 요청해
-  채운다(아래 4.6).
+- **Block** $b$: `(height, cmd, parent, justify)`.
+  - `height`: monotonically increasing. `parent`: the parent in the block tree
+    (hash/pointer).
+  - `cmd`: the client command to execute (one cache write = one block; batching is
+    deferred).
+  - `justify`: the QC this block carries (certifying an ancestor towards the
+    parent).
+- **QC (quorum certificate)**: a set of $2f+1$ distinct partial signatures (votes)
+  over a specific (height, block digest). No threshold-signature library is used:
+  individual signatures are listed and verified one by one (no new dependency; the
+  same approach as PBFT). QC size is $O(n)$ — a deferred optimization target.
+- **genesis** $b_0$: carries a hard-coded QC pointing at itself. Initially
+  `b_exec = b_lock = b_leaf = b_0` and `qc_high` = the QC of $b_0$.
+- Tree retention: blocks are kept as a tree via parent/justify links. Missing
+  ancestors are requested from peers by digest (see §4.6).
 
-### 4.2 체인 규칙 — 정밀 정의 (논문 §5 + Appendix B Notation)
+### 4.2 Chain Rules — precise definition (paper §5 + Appendix B notation)
 
-부모 링크 `b.parent`(블록 트리)와 정당화 `b.justify`(블록이 지니는 QC)를 분리해
-정의한다. QC가 증명하는 블록을 `b.justify.node`라 한다.
+The parent link `b.parent` (block tree) and the justification `b.justify` (the QC a
+block carries) are defined separately. The block a QC certifies is written as
+`b.justify.node`.
 
-- **one-chain 판정** `oneChainedBy(parent a, child c)`:
-  `c.parent == a` **이고** `c.justify.node == a` (자식이 부모를 직접 증명).
-  → 논문 표기 $a(\Leftarrow\land\leftarrow)c$.
-- 리플리카가 새 QC(블록 $c$를 증명)를 알게 되면 (§4.3의 `update`):
-  - **lock (2-chain)**: $c$가 부모를 one-chain하면 그 부모를 락. (직접 one-chain 두 개
-    중 아래쪽: $b' = c.parent$, 조건 `oneChainedBy(b', c)`)
-  - **commit (3-chain)**: 위의 부모 $b'$가 다시 자기 부모 $b$를 one-chain하면
-    $b$를 커밋. (조건 `oneChainedBy(b, b')`)
-- **작업 예제** (각 블록이 직접 부모를 증명하는 연속 체인, `B1`이 cmd1 보유):
+- **one-chain test** `oneChainedBy(parent a, child c)`:
+  `c.parent == a` **and** `c.justify.node == a` (the child directly certifies its
+  parent). → paper notation $a(\Leftarrow\land\leftarrow)c$.
+- When a replica learns a new QC (certifying block $c$), it runs `update` (§4.3):
+  - **lock (2-chain)**: if $c$ one-chains its parent, lock that parent (the lower
+    of two direct one-chain steps: $b' = c.parent$, condition
+    `oneChainedBy(b', c)`).
+  - **commit (3-chain)**: if that parent $b'$ in turn one-chains its own parent
+    $b$, commit $b$ (condition `oneChainedBy(b, b')`).
+- **Worked example** (a consecutive chain where each block directly certifies its
+  parent, with `B1` carrying cmd1):
 
   ```
   B0(genesis) ← B1 + QC(B0) ← B2 + QC(B1) ← B3 + QC(B2) ← B4 + QC(B3)
   ```
 
-  | 새로 증명된 블록(수신/형성) | lock | commit |
+  | Newly certified block (received/formed) | lock | commit |
   |---|---|---|
-  | QC(B1) → c=B1 | B0 (무해) | — |
-  | QC(B2) → c=B2 | B1 | B0 (무cmd, 무해) |
-  | QC(B3) → c=B3 | B2 | **B1 (cmd1 커밋!)** |
+  | QC(B1) → c=B1 | B0 (harmless) | — |
+  | QC(B2) → c=B2 | B1 | B0 (no cmd, harmless) |
+  | QC(B3) → c=B3 | B2 | **B1 (cmd1 committed!)** |
   | QC(B4) → c=B4 | B3 | B2 |
 
-  즉 **리더/팔로워 공통으로 "블록 2개 위의 QC가 형성되면 그 블록이 커밋"**
-  (cmd1은 QC(B3) 형성 시 커밋 = 논문 "v4 끝에 커밋"). 리더는 QC를 직접 집계하므로
-  자기 블록 커밋을 팔로워보다 한 블록 먼저 알지만, 커밋은 로컬 판정이라 안전하다.
-  팔로워는 다음 제안이 실어 보내는 QC로 같은 커밋에 도달한다.
+  In other words, **for leaders and followers alike, a block commits once the QC two
+  blocks above it forms** (cmd1 commits when QC(B3) forms = the paper's "committed
+  at the end of v4"). A leader aggregates votes itself, so it learns its own block's
+  commit one block earlier than a follower, but commit is a local decision and that
+  is safe. A follower reaches the same commit through the QC carried by the next
+  proposal.
 
-  > ⚠️ 리뷰 예시 보정: 다이어그램이 "B3까지 오면 B1 commit"으로 그려졌는데,
-  > 이는 논문 기준 **lock 지점**(B3 수신 시 lock=B1, commit=B0)이다. B1 커밋은
-  > B4(QC(B3)를 실은 제안) 도착/형성 시점이다. 2-chain lock / 3-chain commit으로
-  > 고정하고, HS-M1 테스트가 이 경계를 직접 고정한다.
+  > ⚠️ Review correction: the original diagram said "B1 commits once B3 arrives",
+  > but per the paper that point is the **lock** boundary (on receiving B3:
+  > lock=B1, commit=B0). B1 commits when B4 (the proposal carrying QC(B3)) arrives or
+  > forms. The rule is pinned as 2-chain lock / 3-chain commit, and the HS-M1 tests
+  > pin this exact boundary.
 
-### 4.3 replica 상태 & 규칙 (구현 기준)
+### 4.3 Replica State and Rules (implementation reference)
 
-상태: `b_exec`(마지막 실행), `b_lock`(락), `qc_high`(가장 높은 QC), `head`(마지막 제안/
-수용 블록), `vheight`(마지막 투표 높이). genesis $b_0$는 자기 자신을 증명하는 하드코딩
-QC를 가져 초기 `b_exec=b_lock=head=b0`, `qc_high=QC(b0)`.
+State: `b_exec` (last executed), `b_lock` (the lock), `qc_high` (highest QC),
+`head` (last proposed/accepted block), `vheight` (last voted height). Genesis
+$b_0$ carries a hard-coded QC certifying itself, so initially
+`b_exec=b_lock=head=b0`, `qc_high=QC(b0)`.
 
-- **`update(qc')`** (QC 수신 시, §4.2 규칙의 실행): 더 높은 QC면 `qc_high` 갱신 →
-  증명 블록 $c$ 기준 one-chain walk로 lock/commit 전진 → 커밋된 블록의 `cmd`를 체인
-  순서로 실행. 논문 §6 Alg. 4의 `update()`를 따르되 **M1은 직접 one-chain(틈 없음)**
-  만 처리하고, 갭(더미 노드/완화)은 HS-M2의 뷰 동기화와 함께 확장한다.
-  (ponytail: M1은 연속 높이 + `justify.node == parent` 제약. 갭 허용은 M2.)
-- **투표 규칙 (safeNode)**: 리더 제안 $b$에 투표 iff
-  1. $b.height > vheight$ (단조성 — 같은 높이 재투표 금지 ⇒ Lemma 1의 QC 유일성), 그리고
-  2. $b$의 branch가 `b_lock` 확장 **또는** $b.justify.node.height > b_lock.height$.
-  구조 검증(M2): 제안은 블록이 속한 뷰의 리더가, `justify` 유효(≥2f+1),
-  `justify.node == parent`, `height > parent.height`(갭 허용 — 뷰 전환 후
-  deposed 리더의 in-flight 높이를 건너뀜). 낡은 뷰 제안은 무시, 미래 뷰 제안은
-  수신자가 뷰를 전진(빠른 복귀). (서명 검증은 M3.)
-- **리더**: `createLeaf`로 제안(부모 = `head`, justify = `qc_high`). 제안은 모두에게
-  멀티캐스트, 투표는 리더에게(유임 리더 가정 — M1). 리더는 자기 블록에도 스스로 투표해
-  쿼럼에 포함된다. 리더 전환/회전은 HS-M2 pacemaker에서 `leader(height)` 훅으로 교체.
-- **HS-M1/M2에는 클라이언트 큐/드라이버가 없다**: 리더는 명시적 `Propose(cmd)`로만
-  블록을 만들고, 다음 블록(빈 블록 포함)은 테스트/상위 계층이 수동으로 이어 제안해
-  커밋을 진행시킨다. 클라이언트 대기열·자동 진행·Submit은 **HS-M5**(store 통합에서
-  `Submit`+`WaitCommitted`로 필요)에 추가. (리뷰: 합의 코어를 최소화, safety 우선.)
+- **`update(qc')`** (on receiving a QC; executes the §4.2 rules): if the QC is
+  higher, raise `qc_high` → walk the direct one-chain below the certified block $c$
+  to advance lock/commit → execute the `cmd` of every committed block in chain
+  order. This follows `update()` from paper §6 Alg. 4, except that **M1 only handles
+  direct one-chains (no gaps)**; gaps (dummy nodes/relaxation) are introduced
+  together with HS-M2's view synchronization.
+  (ponytail: M1 requires consecutive heights and `justify.node == parent`. Gap
+  tolerance arrives in M2.)
+- **Vote rule (safeNode)**: vote for a leader proposal $b$ iff
+  1. $b.height > vheight$ (monotonicity — no re-voting at a height ⇒ Lemma 1's QC
+     uniqueness), and
+  2. $b$'s branch extends `b_lock` **or** $b.justify.node.height > b_lock.height$.
+  Structural validation (M2): the proposal must come from the leader of the block's
+  own view, `justify` must be valid (≥2f+1), `justify.node == parent`, and
+  `height > parent.height` (gaps allowed — a post-view-change block skips the
+  deposed leader's in-flight height). Stale-view proposals are ignored; a
+  future-view proposal makes the receiver advance its view (fast recovery).
+  (Signature verification arrives in M3.)
+- **Leader**: proposes via `createLeaf` (parent = `head`, justify = `qc_high`).
+  Proposals are multicast to everyone; votes go to the leader (incumbent-leader
+  assumption in M1). The leader also votes for its own block, so it is part of the
+  quorum. Leader succession/rotation is swapped in by the HS-M2 pacemaker behind a
+  `leader(height)` hook.
+- **HS-M1/M2 have no client queue or driver**: the leader creates blocks only
+  through an explicit `Propose(cmd)`, and the caller (test or higher layer) manually
+  proposes the following blocks (including empty ones) to advance commits. The
+  client queue, automatic progress and `Submit` are added in **HS-M5** (needed as
+  `Submit`+`WaitCommitted` for store integration). (Review: keep the consensus core
+  minimal, safety first.)
 
-### 4.4 메시지 타입 (전체 2종 + 동기화 보조)
+### 4.4 Message Types (two in total, plus sync helpers)
 
-1. **Proposal**(=`new-view`+제안): 리더가 새 블록(부모/justify 포함)을 멀티캐스트.
-2. **Vote**(부분 서명): `(height, digest)`에 대한 리플리카 서명 → 다음 리더.
-3. 뷰 동기화(new-view 수집, 결손 블록 fetch)는 위 두 타입의 조합 + 보조 요청/응답으로
-   구현(아래 4.6). 이는 논문 §5의 메시지 최소성과 일치하고, PBFT의 별도 view-change
-   메시지(VIEW-CHANGE/NEW-VIEW)가 사라진다.
+1. **Proposal** (= `new-view` + proposal): the leader multicasts a new block
+   (including its parent and justify).
+2. **Vote** (partial signature): a replica's signature over `(height, digest)` →
+   the next leader.
+3. View synchronization (collecting new-views, fetching missing blocks) is built
+   from combinations of the two types plus auxiliary request/response messages (see
+   §4.6). This matches the paper's §5 message minimality, and PBFT's separate
+   view-change messages (VIEW-CHANGE/NEW-VIEW) disappear.
 
-### 4.5 Pacemaker (liveness, 논문 §6 + §4.4)
+### 4.5 Pacemaker (liveness, paper §6 + §4.4)
 
-- 각 리플리카는 현 리더가 진행을 못 만들면(제안 수신 타임아웃) **타임아웃을
-  지수 백오프**로 늘리며 `new-view`(=자신이 아는 최고 QC)를 다음 리더로 전송.
-- 다음 리더는 $2f+1$개의 new-view에서 **최고 QC**를 골라 그 지점에서 이어 제안
-  (PBFT식 "증명 수집" 불필요 — 최고 QC만 고르면 안전, §4.4 liveness 증명).
-- 회전: 정렬 멤버셋 라운드-로빈. 결정적이라 테스트에서 직접 트리거 가능
-  (PBFT `StartViewChange`와 같은 결정적 테스트 수단 제공).
-- 락은 hotstuff가 "마음을 바꾸는" 3-phase 구조 덕에 별도 unlock 증명이 필요 없다.
+- When a replica sees no progress from the current leader (proposal-receive
+  timeout), it sends a `new-view` (= the highest QC it knows) to the next leader,
+  growing its **timeout by exponential backoff**.
+- The next leader picks the **highest QC** among $2f+1$ new-views and continues
+  proposing from there (no PBFT-style "certificate collection" — choosing the
+  highest QC alone is safe, per §4.4's liveness proof).
+- Rotation: round-robin over the sorted member set. It is deterministic, so tests
+  can trigger it directly (giving the same deterministic test lever as PBFT's
+  `StartViewChange`).
+- Locks need no separate unlock proof: hotstuff's "changing your mind" 3-phase
+  structure removes the need for one.
 
-### 4.6 상태 동기화(경량)
+### 4.6 State Synchronization (lightweight)
 
-- 커밋/락/투표에 필요한 건 **현재 branch의 블록 + QC**뿐. 낡은 블록은 GC 가능
-  (ponytail: 체크포인트 기반 상태 전송은 후순위 — 결손 시 다이제스트로 피어에게
-  블록 fetch만 수행. $f$ 이하 faulty·연결 가정).
-- 리스타트 리플리카는 WAL에서 복구된 블록 트리/watermark로 재참여(HS-M4).
+- Commit/lock/vote need only **the blocks and QCs on the current branch**. Stale
+  blocks may be GC'd (ponytail: checkpoint-based state transfer is deferred — on a
+  gap, only fetch the missing blocks by digest from a peer; assumes at most $f$
+  faulty and connectivity).
+- A restarting replica rejoins with the block tree/watermark recovered from its WAL
+  (HS-M4).
 
-### 4.7 구현 계층 (관심사 분리 — 리뷰)
+### 4.7 Implementation Layers (separation of concerns — review)
 
 ```
 HotStuffNode
-├── Core        (본 패키지: 블록 트리/QC/락/commit rule/safeNode/투표 상태)
-│    이벤트: Propose, ReceiveProposal, ReceiveVote, ReceiveQC, (M2+) Timeout
-├── Transport   (Core와 분리된 인터페이스 — M1 인메모리, 이후 TCP)
-├── Auth        (M3: Ed25519 서명/검증 — Core 위에 얹는 계층)
-└── WAL         (M4: 영속화 — Core와 독립)
+├── Core        (this package: block tree/QC/lock/commit rule/safeNode/vote state)
+│    events: Propose, ReceiveProposal, ReceiveVote, ReceiveQC, (M2+) Timeout
+├── Transport   (interface separate from Core — in-memory in M1, TCP later)
+├── Auth        (M3: Ed25519 sign/verify — a layer on top of Core)
+└── WAL         (M4: persistence — independent of Core)
 ```
 
-- **Core는 순수 상태 머신**: Transport/Auth/WAL에 대한 의존성이 없고,
-  `Propose/HandleProposal/HandleVote` 같은 이벤트만 받는다. 따라서 M1은 완전 결정적
-  인메모리 테스트로 검증하고, 이후 TCP 전송을 붙여도 합의 로직 재검증이 줄어든다.
-- M1의 vote는 **서명 없는 "누가 투표했는가"** 만 표현(투표자 id 집합) — 암호학은 M3에서
-  `Signed Vote → QC 검증` 계층으로 추가. 합의 버그와 인증 버그를 독립 검증한다.
-- M1 단계에서 network/TLS/WAL/Ed25519를 동시에 넣지 않는다. 멤버십은 고정
-  $3f+1$ (리뷰). HotStuff 고유의 상태 모델(블록 트리/QC 체인)로 구현하며 PBFT의
-  pre-prepare/prepare/commit/view-change 단계를 이름만 바꿔 재사용하지 않는다.
+- **Core is a pure state machine**: it has no dependency on Transport/Auth/WAL and
+  receives only events such as `Propose/HandleProposal/HandleVote`. M1 is therefore
+  verified with fully deterministic in-memory tests, and attaching TCP later reduces
+  the amount of consensus logic that must be re-verified.
+- M1's vote expresses only **who voted** (a set of voter ids), with no signatures —
+  cryptography is added in M3 as the `Signed Vote → QC verification` layer. This
+  keeps consensus bugs and authentication bugs independently verifiable.
+- M1 does not introduce network/TLS/WAL/Ed25519 at the same time. Membership is
+  fixed at $3f+1$ (review). The implementation uses HotStuff's own state model
+  (block tree/QC chain) and does not reuse PBFT's
+  pre-prepare/prepare/commit/view-change phases under new names.
 
-### 4.8 코드 레벨 불변식 (리뷰 — 테스트로 고정)
+### 4.8 Code-Level Invariants (review — pinned by tests)
 
-구현/테스트가 항상 성립을 검증할 불변식:
+Invariants that the implementation and tests must always verify:
 
 ```
-QC requires ≥ 2f+1 valid member votes          (비멤버 투표 불가)
-Committed block ⇒ has a valid 3-chain          (직접 one-chain 2단 + QC)
-Committed blocks ⇒ form a single prefix        (분기 없음)
-Conflicting blocks ⇒ cannot both be committed  (같은 높이 QC 유일성 포함)
+QC requires ≥ 2f+1 valid member votes          (non-members cannot vote)
+Committed block ⇒ has a valid 3-chain          (two direct one-chains + QC)
+Committed blocks ⇒ form a single prefix        (no fork)
+Conflicting blocks ⇒ cannot both be committed  (includes QC uniqueness per height)
 Non-validator ⇒ cannot contribute to quorum
 ```
 
-- **Safety 테스트**: 서로 다른 두 conflicting 블록을 동시에 커밋하지 않음.
-- **Liveness 테스트**: 정상 네트워크+쿼럼이면 결국 커밋. "commit이 안 됨"(지연)과
-  "잘못된 블록이 커밋됨"(안전 위반)을 별도 테스트로 구분.
+- **Safety tests**: two conflicting blocks are never committed simultaneously.
+- **Liveness tests**: with a healthy network and a quorum, commits eventually
+  happen. "Nothing commits" (latency) and "a wrong block committed" (safety
+  violation) are distinguished by separate tests.
 
-## 5. 기존 코드 재사용 / 삭제 매핑
+## 5. Reuse / Deletion Map Against Existing Code
 
-**그대로 재사용 (변경 없음)**
-- `internal/store`, `internal/wal`(영속 백엔드), `internal/mtls`(전송 TLS),
-  `internal/server`의 `Server`/`Handler`, `pkg/client`, `internal/protocol`.
-- Raft 전 계열은 불변.
+**Reused as-is (unchanged)**
+- `internal/store`, `internal/wal` (persistence backend), `internal/mtls` (transport
+  TLS), `internal/server`'s `Server`/`Handler`, `pkg/client`, `internal/protocol`.
+- The entire raft family is untouched.
 
-**패턴 계승 (PBFT에서 복사-수정, 새 패키지로 이동)**
-- `internal/hotstuff/`: Ed25519 sign/verify 헬퍼, TCP NDJSON 멀티캐스트 transport +
-  구성된 validator 키와 Hello 소유 증명 패턴, TLS on/off 패턴, WAL LogStore 패턴, 테스트용
-  인메모리 transport/클러스터 부트스트랩 헬퍼.
-- `internal/server/hotstuff_cluster.go`: `PbftClusterStore`의 쌍대 —
-  `NewHotstuffClusterStore`, `NewHotstuffApply`, read-your-writes, 리더 리다이렉트.
+**Patterns carried over (copied and adapted from PBFT into the new package)**
+- `internal/hotstuff/`: Ed25519 sign/verify helpers, the TCP NDJSON multicast
+  transport plus the configured-validator-key/Hello-possession pattern, the TLS
+  on/off pattern, the WAL `LogStore` pattern, and in-memory
+  transport/cluster-bootstrap test helpers.
+- `internal/server/hotstuff_cluster.go`: the counterpart of `PbftClusterStore` —
+  `NewHotstuffClusterStore`, `NewHotstuffApply`, read-your-writes, leader redirect.
 
-**삭제 (PBFT 제거)**
-- `internal/pbft/` 전체 (normal case + viewchange + auth + persist + transports + tests).
+**Deleted (PBFT removal)**
+- All of `internal/pbft/` (normal case + viewchange + auth + persist + transports
+  + tests).
 - `internal/server/pbft_cluster.go`, `internal/server/pbft_cluster_test.go`.
-- 참조 정리: `cmd/cacheyd/main.go`의 `-consensus pbft` 분기(문구를 hotstuff 기준으로
-  갱신 — wiring 자체는 별도 단계), `internal/store/store.go`, `internal/wal/*`의
-  OpPBFT 주석, `internal/mtls` 주석, `README.md` 엔진 표/기능 목록.
-- **공개 결정(open item, HS-M4)**: `wal.OpPBFT` 레코드 op는 consensus-log 레코드
-  용도이므로 값은 유지하되 이름을 엔진 중립적으로 다룰지(HotStuff가 이 op를 계승해
-  재사용할지) 구현 시 확정. (WAL 회복 경로는 불변으로 유지하려 함.)
+- Reference cleanup: the `-consensus pbft` branch in `cmd/cacheyd/main.go` (wording
+  updated to the hotstuff baseline — the wiring itself is a separate step), the
+  `OpPBFT` comments in `internal/store/store.go` and `internal/wal/*`, the
+  `internal/mtls` comments, and `README.md`'s engine table/feature list.
+- *(Resolved)*: `wal.OpPBFT` was removed and `wal.OpHotStuff` now carries consensus
+  records; the WAL recovery path keeps its shape.
 
-## 6. 마일스톤 (PBFT M1–M5 넘버링과 평행)
+## 6. Milestones (parallel to the PBFT M1–M5 numbering)
 
-각 마일스톤은 그 단계에서 `go build ./...` + `go test ./...`(repo 규칙: 패키지 직렬
-`-p 1`)가 초록이 되게 마감한다. 단계마다 체크포인트 후 다음으로.
+Each milestone closes with `go build ./...` + `go test ./...` green at that stage
+(repo rule: serialize packages with `-p 1`). Checkpoint after each stage before
+moving on.
 
-- **HS-M1 — Normal-case 코어 (인메모리, 무인증, 리더 고정)**: 블록 트리, QC(투표
-  수집), 3-chain 커밋·2-chain 락, safeNode, 결정적 순서 실행. network/TLS/WAL/Ed25519
-  없음. 리더 = `Config.Leader` 단일 지정(회전·뷰 동기화는 M2). 클라이언트 큐/자동
-  드라이버 없음(명시적 `Propose`).
-  - 파일: `internal/hotstuff/block.go`, `message.go`, `node.go`, `node_test.go`,
+- **HS-M1 — Normal-case core (in-memory, unauthenticated, fixed leader)**:
+  block tree, QC (vote collection), 3-chain commit / 2-chain lock, safeNode,
+  deterministic in-order execution. No network/TLS/WAL/Ed25519. Leader = the single
+  `Config.Leader` (rotation and view sync are M2). No client queue or auto driver
+  (explicit `Propose`).
+  - Files: `internal/hotstuff/block.go`, `message.go`, `node.go`, `node_test.go`,
     `e2e_test.go`.
-  - 테스트 매트릭스(리뷰): QC 없는 블록 거부 / QC 1개뿐 chain(커밋 없음) / 2-chain
-    (락만) / 3-chain(커밋) / 서로 다른 fork(단일 프리픽스) / 잘못된 parent / 같은
-    높이 conflicting 블록(재투표 금지·QC 유일성) / 이미 커밋된 블록보다 과거 블록
-    커밋 시도 무시. + 쿼럼 경계(2f, 2f+1), 비멤버 투표 무시, 단일 리더 커밋&전
-    리플리카 동일 순서 실행(liveness), Safety/Liveness 테스트 구분, §4.8 불변식 assert.
-- **HS-M2 — Pacemaker / 뷰 동기화 (무인증) — 구현 완료**: `view`/`leaderOf(v)`
-  결정적 회전(뷰-0 리더 = `Config.Leader`), `StartViewChange`(결정적 의심, pbft와
-  같은 패턴) + `SetViewTimeout`(지수 백오프 실타이머, 활성 리더는 자가 의심 안 함),
-  `ViewChange` 수집 → 2f+1 시 **최고 QC를 베이스로 채택**(`head`를 QC 증명 블록으로
-  재설정 + `freshBase`로 한 높이 스킵 — deposed 리더의 in-flight 블록보다 항상
-  높아 투표 단조성을 보존), 미래 뷰 제안으로 뷰 전진(빠른 복귀), 낡은 뷰 제안 무시,
-  `Fetch`/`BlockMsg`로 결손 조상을 bottom-up 복귀(`pendingBlocks`: 부모 도착 시
-  연쇄 삽입). 클라이언트 큐/자동 진행(Submit)은 HS-M5로 이동.
-  - 파일: `viewchange.go`, `viewchange_test.go` (+ `message.go`에
-    ViewChange/Fetch/BlockMsg, `Block.View`).
-  - 테스트: 리더 사망 → 2f+1 의심 → 새 리더 활성화 → 진행 재개(커밋 프리픽스 보존),
-    분할/복귀(fetch로 따라잡기), 의심/타임아웃 없이는 진행 없음, 쿼럼 미달 의심은
-    리더 비활성 유지, 실타이머로 자동 선출, 높이 갭 수용&투표, 스테일 리더 제안 무시
-    (`TestLeaderDeathViewChangeResumes`, `TestRejoinAfterPartition`,
-    `TestViewTimeoutFires`, `TestViewChangeNeedsQuorum`, `TestGapAcceptedAndVoted`,
-    `TestStaleLeaderProposalIgnored`, `TestNoProgressWithoutViewChange` 등).
-  - ponytail 한계: (a) 다수보다 높은 뷰로 잘못 전진한 고립 리플리카는 스스로
-    내려오지 않음(리더 교체 시 복귀) — 정상 파티션에서 안전·다수 활성은 보존.
-    (b) fetch는 결손 블록을 가진 피어(원 제안자)가 응답한다고 가정.
-    (c) 갭은 수용하되 블록은 항상 직접 부모(`justify.node == parent`)를 증명 —
-    더미 노드/비직접 완화는 미적용(현 설계로 충분).
-- **HS-M3 — Ed25519 인증 — 구현 완료**: 제안/투표/뷰체인지/블록응답 서명·검증, QC =
-  (voter, sig) 2f+1 개별 검증, genesis QC는 신뢰 루트로 특례(B1만 실을 수 있어
-  안전), 키 배선은 사전 구성된 validator 공개키로 신뢰 부트스트랩(`SetPeerKey`; Hello는
-  해당 키 소유 증명, mTLS는 전송 계층 강화로 후순위),
-  수신 모든 메시지가 `From == 서명자`여야 통과(위조 거부), 변조 거부.
-  - 파일: `auth.go`(신규), `message.go`(`json:"sig,omitempty"` 태그 — canonical에서
-    `sig` 삭제가 동작하도록 소문자 태그 필수), `node.go`/`viewchange.go`(모든 발신
-    서명 + 수신 검증 + `qcValid` 필터), `node_test.go`(서명 헬퍼 `testKeyOf`/
-    `wirePhantom`/`signVote`, `prop`/`quorumQC`/`mainChain` 서명화), `e2e_test.go`
-    (`startCluster`에 키 배선), `auth_test.go`(신규).
-  - 테스트: 위조 발신자 거부(`TestForgedSenderRejected`), 변조 거부
-    (`TestTamperedMessageRejected`), 정통 악의 리더 이중 제안 각각 유효(위협 모델,
-    `TestByzantineLeaderEquivocatesAuthentically`), 정통 vc에 실은 조작 고QC는 신규
-    리더가 필터(`TestViewChangeWithFabricatedHighQCRejected`), 비멤버 투표 무시,
-    sub-quorum QC 거부(M3부터 genesis 위 sub-quorum은 신뢰 루트라 실재 블록 기준으로
-    테스트 재구성), e2e/뷰체인지 전 클러스터 테스트(실 키 배선).
-  - 버그 수정: (a) 서명 필드에 `json:"sig,omitempty"` 태그 누락 → canonical에서
-    `sig` 삭제가 안 되어 서명이 자기 자신을 포함(전 메시지 검증 실패);
-    (b) 팔로워 발신 투표에 서명 누락 → 리더가 투표 전부 거부(QC 미형성);
-    (c) `HandleProposal`이 락 밖에서 `n.leader`를 읽어 타이머 뷰체인지와 데이터
-    레이스 → 락 안에서 캡처; (d) `TestViewTimeoutFires` 20ms 기본 타이머가 서명
-    비용(+race) 타이밍 경쟁으로 새 리더를 제안 전 축출 → 150ms로 상향(의도 보존).
-- **HS-M4 — WAL 영속화 & 복구 — 구현 완료**: 수용한 블록(pkBlock, Justify QC 동봉)
-  · qcHigh 상승(pkQC — 리더의 투표 집계 QC는 어떤 블록에도 박혀 있지 않으므로 별도
-  기록) · 실행 watermark(pkApplied — `commitUpToLocked` 후 bExec id) · 투표 높이
-  (pkVoted — vHeight 상승 시; 크래시 후 재투표 방지 = QC 유일성)를 `wal.OpHotStuff`
-  레코드로 동기 영속화. 리스타트 시 WAL replay로 트리/watermark/vHeight 복구 후
-  `FinishRecovery()`가 복구된 QC를 구조적 원칙(서명 재검증 없이 — 영속 QC는 수용 시
-  검증됨)으로 재생해 qcHigh/head(=최고 QC 증명 블록)/lock/exec을 재계산하고
-  watermark 이하 체인을 applied로 표시 → applyFn 재실행 없음(멱등 복구).
-  - 파일: `persist.go`(신규: `LogStore`/`NewWALLogStore`/`ApplyRecoveredRecord`/
-    `FinishRecovery`), `node.go`(proposeLocked/addBlockLocked/onNewQCLocked/
-    handleProposalLocked/commitUpToLocked 영속 훅), `internal/wal`(`OpHotStuff` op +
-    recovery 허용 목록), `wal_persist_test.go`(신규).
-  - 테스트: `TestWALPersistenceRestart`(단일 노드 커밋 → 재시작 → 재실행 없음 +
-    계속 커밋), `TestWALRecoveryRebuildsTree`(미커밋 수용 블록/QC 복구 후 커밋),
-    `TestWALVoteHeightSurvivesRestart`(팔로워 투표 높이 복구 → 재투표 방지 + 상위
-    투표 재개), `TestWALRecoveryIgnoresForeignOps`(비핫스터프 레코드 무시).
-  - ponytail 한계: (a) watermark 등 영속화는 best-effort(실패 시 로그, 핸들러 중단
-    없음) — PBFT M4와 동일, 이후 크래시 시 마지막 스팬 재실행 가능(운영 배포는
-    실패 치명화/재시도 필요). (b) WAL 무제한 성장(엔진 수준 스냅샷 없음, `DisableRotation`
-    로그 모드) — 압축은 후순위. (c) 리더의 vote-집계 QC가 영속화되지만, fetch 중
-    베이스 QC처럼 certified 블록이 미도착인 순간의 크래시는 해당 QC를 잃을 수 있음
-    (재참여로 복구, 안전성 무관).
-- **HS-M5 — 서버 통합 & PBFT 삭제 — 구현 완료**: `internal/hotstuff/tcp_transport.go`
-  (NDJSON TCP, 연결마다 사전 구성 validator key를 검증하는 Hello + `ConnectPeers`
-  full-mesh 키 교환), `internal/server/hotstuff_cluster.go`(`HotStuffClusterStore`
-  — 리더만 쓰기, 리더가 커맨드 블록 위 빈 블록을 flush해 3-chain 커밋 유도;
-  `NewHotStuffApply`), `internal/server/hotstuff_cluster_test.go`(4-노드 TCP
-  클러스터: 쓰기/읽기 수렴, 팔로워 `ErrNotLeader` 거부, 리더 힌트, DEL).
-  `internal/pbft` 전체 + `server/pbft_cluster.go`/`_test.go` 삭제, `wal`에서
-  `OpPBFT` 제거(store는 `OpHotStuff`를 no-op으로), `cmd/cacheyd`/`README.md`/`mtls`
-  참조 정리. `cacheyd -consensus hotstuff` wiring은 후순위(고정 멤버 정적 피어 리스트).
-  - 잡은 것: HotStuff 메시지 패턴(제안 리더→전체, 투표 전체→리더)은 팔로워끼리
-    절대 연결하지 않아 transport 연결은 시작 시 `ConnectPeers`로 전 메시지 mesh를
-    만든다(pbft는 broadcast라 자연 full-mesh). 키 신뢰는 이 연결 이전의 validator
-    구성으로 이미 확정된다.
-- **HS-M5 이후(후순위)**: `cacheyd -consensus hotstuff` wiring(정적 피어 리스트),
-  커맨드 배칭, threshold signature QC, 체크포인트/상태 전송, 동적 멤버십.
+  - Test matrix (review): block without a QC rejected / chain with only one QC (no
+    commit) / 2-chain (lock only) / 3-chain (commit) / divergent forks (single
+    prefix) / wrong parent / conflicting blocks at one height (no re-vote, QC
+    uniqueness) / commit attempt below an already-committed block ignored. Plus the
+    quorum boundary (2f, 2f+1), non-member votes ignored, single-leader commit with
+    every replica executing in the same order (liveness), separate safety/liveness
+    tests, and assertions for the §4.8 invariants.
+- **HS-M2 — Pacemaker / view synchronization (unauthenticated) — done**:
+  `view`/`leaderOf(v)` deterministic rotation (view-0 leader = `Config.Leader`),
+  `StartViewChange` (deterministic suspicion, the same pattern as pbft) +
+  `SetViewTimeout` (real timer with exponential backoff; an active leader never
+  suspects itself), collecting `ViewChange`s → on 2f+1 **adopt the highest QC as the
+  base** (reset `head` to the QC-certified block + skip one height via `freshBase`,
+  which is always above the deposed leader's in-flight block and so preserves vote
+  monotonicity), advance the view on a future-view proposal (fast recovery), ignore
+  stale-view proposals, and recover missing ancestors bottom-up with
+  `Fetch`/`BlockMsg` (`pendingBlocks`: chain-insert as parents arrive). The client
+  queue / automatic progress (`Submit`) moved to HS-M5.
+  - Files: `viewchange.go`, `viewchange_test.go` (plus ViewChange/Fetch/BlockMsg and
+    `Block.View` in `message.go`).
+  - Tests: leader death → 2f+1 suspicions → new leader activates → progress resumes
+    (committed prefix preserved), partition/rejoin (catch up via fetch), no progress
+    without suspicion/timeout, sub-quorum suspicion leaves the leader inactive,
+    automatic election via the real timer, height gaps accepted and voted, stale
+    leader proposals ignored (`TestLeaderDeathViewChangeResumes`,
+    `TestRejoinAfterPartition`, `TestViewTimeoutFires`,
+    `TestViewChangeNeedsQuorum`, `TestGapAcceptedAndVoted`,
+    `TestStaleLeaderProposalIgnored`, `TestNoProgressWithoutViewChange`, …).
+  - ponytail limits: (a) an isolated replica that wrongly advanced to a view higher
+    than the majority does not walk itself back (it recovers on the next leader
+    change) — safety and majority liveness still hold under normal partitions.
+    (b) fetch assumes the peer holding the missing block (the original proposer)
+    answers. (c) gaps are accepted, but a block always directly certifies its parent
+    (`justify.node == parent`) — dummy nodes / indirect relaxation are not applied
+    (the current design is sufficient).
+- **HS-M3 — Ed25519 authentication — done**: sign/verify for proposals, votes, view
+  changes and block replies; a QC is 2f+1 individually verified `(voter, sig)`
+  entries; a genesis QC is special-cased as the trust root (safe because only B1 can
+  carry it); key wiring bootstraps trust from preconfigured validator public keys
+  (`SetPeerKey`; Hello proves possession of that key); every received message must
+  satisfy `From == signer` (forgery rejected) and tampering is rejected.
+  - Files: `auth.go` (new), `message.go` (the `json:"sig,omitempty"` tag — a
+    lowercase tag is required for the canonical-form `sig` removal to work),
+    `node.go`/`viewchange.go` (sign all outgoing messages + verify inbound +
+    `qcValid` filter), `node_test.go` (signing helpers `testKeyOf`/`wirePhantom`/
+    `signVote`, signed `prop`/`quorumQC`/`mainChain`), `e2e_test.go` (key wiring in
+    `startCluster`), `auth_test.go` (new).
+  - Tests: forged sender rejected (`TestForgedSenderRejected`), tampering rejected
+    (`TestTamperedMessageRejected`), an authentic Byzantine leader equivocating is
+    accepted by each follower in isolation (the threat model,
+    `TestByzantineLeaderEquivocatesAuthentically`), a fabricated high QC stuffed into
+    an authentic vc is filtered by the new leader
+    (`TestViewChangeWithFabricatedHighQCRejected`), non-member votes ignored,
+    sub-quorum QCs rejected (from M3 on, a sub-quorum QC over genesis is the trust
+    root, so the test uses a real block), and all cluster-level e2e/view-change tests
+    (real key wiring).
+  - Bugs fixed: (a) a missing `json:"sig,omitempty"` tag meant canonical form did not
+    delete `sig`, so the signature covered itself (every message failed
+    verification); (b) follower-originated votes were not signed, so the leader
+    rejected them all (no QC ever formed); (c) `HandleProposal` read `n.leader`
+    outside the lock, racing the timer-driven view change → capture it under the
+    lock; (d) `TestViewTimeoutFires`' 20 ms default timer lost a timing race against
+    signature cost (+race overhead) and evicted the new leader before it could
+    propose → raised to 150 ms (intent preserved, flake removed).
+- **HS-M4 — WAL persistence & recovery — done**: accepted blocks (pkBlock, with
+  their Justify QC) · qcHigh raises (pkQC — a leader's vote-aggregated QC is not
+  embedded in any block, so raises are recorded separately) · the executed watermark
+  (pkApplied — the bExec id after `commitUpToLocked`) · the vote height (pkVoted — on
+  every vHeight raise; prevents re-voting after a crash = QC uniqueness) are
+  synchronously persisted as `wal.OpHotStuff` records. On restart, WAL replay
+  restores the tree/watermark/vHeight, then `FinishRecovery()` replays the recovered
+  QCs structurally (no signature re-verification — persisted QCs were verified when
+  accepted) to recompute qcHigh/head (= the highest QC's block)/lock/exec and marks
+  the chain at or below the watermark applied → applyFn never re-runs (idempotent
+  recovery).
+  - Files: `persist.go` (new: `LogStore`/`NewWALLogStore`/`ApplyRecoveredRecord`/
+    `FinishRecovery`), `node.go` (persistence hooks in
+    proposeLocked/addBlockLocked/onNewQCLocked/handleProposalLocked/commitUpToLocked),
+    `internal/wal` (the `OpHotStuff` op + the recovery allow-list),
+    `wal_persist_test.go` (new).
+  - Tests: `TestWALPersistenceRestart` (single node commits → restart → no
+    re-execution + keeps committing), `TestWALRecoveryRebuildsTree` (uncommitted
+    accepted blocks/QCs recovered, then committed), `TestWALVoteHeightSurvivesRestart`
+    (follower vote height restored → no re-vote + voting resumes above it),
+    `TestWALRecoveryIgnoresForeignOps` (non-HotStuff records ignored).
+  - Phase 1 additions: `TestWALQCRecoveryRestoresBase` (the recovered
+    qcHigh/head/lock/exec equal the pre-crash state), `TestWALRestartRejoinsAtHigherView`
+    (a restarted replica joins a higher view only with a 2f+1 VC certificate, then
+    votes above its recovered height), `TestWALHeldVoteBlocksRestartedDoubleVote`
+    (a vote that was persisted but never sent still blocks a conflicting vote at the
+    same height after restart).
+  - ponytail limits: (a) persistence of the watermark, etc. is best-effort (a failure
+    logs, the handler continues) — as in PBFT M4, so a later crash may re-execute the
+    last span (production should make write failures fatal or retried). (b) WAL growth
+    is unbounded (no engine-level snapshot; `DisableRotation` log mode) — compaction
+    is deferred. (c) A leader's vote-aggregated QC is persisted, but a crash at a
+    moment when a certified block has not arrived (e.g. the base QC during a fetch)
+    can lose that QC (recovery is by rejoining; safety is unaffected).
+- **HS-M5 — Server integration & PBFT removal — done**:
+  `internal/hotstuff/tcp_transport.go` (NDJSON TCP, a Hello that verifies the
+  preconfigured validator key on every connection + `ConnectPeers` full-mesh key
+  exchange), `internal/server/hotstuff_cluster.go` (`HotStuffClusterStore` — leader-only
+  writes; the leader flushes empty blocks above a command block to force the 3-chain
+  commit; `NewHotStuffApply`), `internal/server/hotstuff_cluster_test.go` (4-node TCP
+  cluster: write/read convergence, follower `ErrNotLeader` rejection, leader hint,
+  DEL). All of `internal/pbft` plus `server/pbft_cluster.go`/`_test.go` were deleted,
+  `OpPBFT` was removed from `wal` (the store treats `OpHotStuff` as a no-op), and the
+  `cmd/cacheyd`/`README.md`/`mtls` references were cleaned up.
+  `cacheyd -consensus hotstuff` wiring is deferred (a static peer list with fixed
+  membership).
+  - Pitfall found: HotStuff's message pattern (proposals leader→all, votes all→leader)
+    never connects followers to each other, so the transport builds a full mesh at
+    startup with `ConnectPeers` (pbft broadcasts, so it was naturally full-mesh). Key
+    trust, however, was already settled by the validator configuration before that
+    connection.
+- **Phase 1 — Hardening (before cacheyd wiring) — done**: mutual TLS on the peer
+  transport with node-id SAN pinning; fetch-response validation; QC height agreement;
+  bounded wire frames, Hello deadlines and inbound-connection teardown; the
+  `connMu → pc.mu` lock order; identity-file and TLS-configuration lifecycle rules;
+  and the Byzantine/recovery/transport-fault/concurrency test suites listed in the
+  status block above.
+- **After HS-M5 / Phase 1 (deferred)**: `cacheyd -consensus hotstuff` wiring (static
+  peer list), a leader driver with command batching, threshold-signature QCs,
+  checkpoints/state transfer, and dynamic membership.
 
-## 7. ponytail 한계 (명시적 트레이드오프)
+## 7. ponytail Limits (explicit trade-offs)
 
-- 읽기는 primary의 read-your-writes(PBFT ClusterStore와 동일 한계; quorum 선형화 읽기는
-  raft read-index와 함께 후순위). 각 위치 `ponytail:` 주석으로 표기.
-- 커밋 지연이 3-block(느림은 의도). 블록 배칭 없음 → 쓰기 1건당 블록 1개.
-- QC에 threshold signature 미사용 → QC 크기 $O(n)$ 서명.
-- 멤버 고정/재구성 없음. 리더 회전은 결정적(랜덤성 없음) — 활성은 지수 백오프로 보장.
+- Reads are primary read-your-writes (the same limitation as the PBFT ClusterStore;
+  quorum-linearizable reads are deferred alongside raft read-index). Each site is
+  marked with a `ponytail:` comment.
+- Commit latency is 3 blocks (slow on purpose). No block batching → one block per
+  write.
+- No threshold signatures in QCs → QC size is $O(n)$ signatures.
+- Fixed membership, no reconfiguration. Leader rotation is deterministic (no
+  randomness) — liveness is guaranteed by exponential backoff.
+- Phase 1 additions: the transport is authenticated by mTLS, but the suspicion
+  timer is not yet wired into `OpenHotStuffNode` (tests drive `StartViewChange`
+  deterministically), so an unattended cluster currently relies on an external
+  driver for leader-failure liveness. A restarted follower also catches up only by
+  riding the next chain advance (no separate state-sync protocol).
+- Persistence of blocks/QCs/watermark stays best-effort (a failed write logs and
+  the handler proceeds); WAL growth is unbounded (no engine-level snapshot) and
+  `blocks`/`applied` are never GC'd.
 
-## 8. 참고
+## 8. References
 
 - Yin et al., HotStuff (arXiv:1803.05069), §4–§6, Appendix A/B.
-- 본 repo `internal/pbft`(교체 대상) 및 `internal/raft`(관례·테스트 구조 참조),
-  `internal/mtls`(인증/전송), repo memory `gotchas.md`(PBFT/Raft 함정 기록은 HotStuff
-  구현 중 같은 실수 회피에 활용).
+- This repo: `internal/raft` (conventions and test-structure reference),
+  `internal/mtls` (authentication/transport), `internal/server/hotstuff_node.go`
+  (durable wiring), and repo memory `gotchas.md` (PBFT/Raft pitfalls are reused to
+  avoid repeating the same mistakes during HotStuff work).

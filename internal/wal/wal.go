@@ -45,6 +45,10 @@ const (
 	// serialized accepted-block / QC / watermark / vote-height payload. Only
 	// the HotStuff recovery hook consumes it.
 	OpHotStuff Op = "HOTSTUFF"
+	// OpMembership marks a HotStuff membership-change command carried in a
+	// block's Cmd. It is part of consensus history (persisted with the block)
+	// but is never applied to the store FSM.
+	OpMembership Op = "MEMBERSHIP"
 )
 
 // Record is a single logical WAL entry. LogIndex is assigned by the writer in
@@ -248,6 +252,15 @@ func (w *WAL) Append(ctx context.Context, rec Record) error {
 
 // MetaCount is an approximate count of records in the current active WAL.
 func (w *WAL) MetaCount() int64 { return w.writer.MetaCount() }
+
+// Rotate forces one sealing/snapshot/rotation cycle now: the active WAL is
+// sealed at the current log index, the store snapshot is written, and the
+// active WAL is truncated to post-boundary records. Used by the HotStuff node
+// to compact the shared WAL after the engine checkpoint is durable. Returns
+// the error instead of calling onFatal (unlike the background path).
+func (w *WAL) Rotate() error {
+	return w.manager.Rotate()
+}
 
 // Close stops the manager and writer goroutines and closes open files. It is
 // idempotent: repeated calls are no-ops.

@@ -31,6 +31,14 @@ const genesisID = "genesis"
 // Block identity is content-derived: two proposals with the same content are
 // the same block, which is what lets replicas recognize equivocation (a
 // leader proposing conflicting blocks at one height yields different ids).
+//
+// Epoch is the configuration generation this block is proposed and voted
+// under. It is NOT part of the content identity (blockID) and NOT a proposer
+// choice: it is derived from the ancestry (the number of committed membership
+// transitions above the block) and validated against that derivation on
+// receipt. Two blocks with the same (View, Height, Parent, Cmd) share an
+// ancestry, hence the same derived epoch, so the identity cannot be ambiguous
+// across configurations.
 type Block struct {
 	View    uint64
 	Height  uint64
@@ -38,6 +46,7 @@ type Block struct {
 	ID      string // content digest; must match blockID(View, Height, Parent, Cmd)
 	Cmd     []byte // nil for empty/genesis blocks
 	Justify *QC    // QC certifying an ancestor (== Parent in HS-M1)
+	Epoch   uint64 // configuration generation (chain-derived, validated)
 }
 
 // blockID returns the deterministic identity of a block. It is a plain content
@@ -48,19 +57,33 @@ func blockID(view, h uint64, parent string, cmd []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// QC is a quorum certificate: proof that 2f+1 distinct cluster members voted
-// for the block with NodeID at Height. Since HS-M3 every member's partial vote
-// is an Ed25519 signature over the vote tuple, stored here so a QC is
-// self-contained and verifiable by any replica that knows the members' public
-// keys. Votes maps voter id -> that voter's signature.
+// QC is a quorum certificate: proof that 2f+1 distinct members of the
+// ValidatorSet of Epoch voted for the block with NodeID at Height. Since
+// HS-M3 every member's partial vote is an Ed25519 signature over the vote
+// tuple, stored here so a QC is self-contained and verifiable by any replica
+// that knows the epoch's public keys. Votes maps voter id -> that voter's
+// signature.
+//
+// Epoch binds the QC to the configuration that created it: qcValid checks the
+// QC against ValidatorSet(Epoch) — voter membership, public keys, signatures
+// and quorum — and requires Epoch to equal the certified block's epoch when
+// that block is known. A QC's epoch is never trusted as-is; it is validated
+// against the block it certifies.
 type QC struct {
+	Epoch  uint64
 	NodeID string
 	Height uint64
 	Votes  map[string][]byte // member id -> Ed25519 vote signature
 }
 
+// newQC returns an epoch-0 QC (the genesis epoch; test shorthand).
 func newQC(nodeID string, height uint64) *QC {
-	return &QC{NodeID: nodeID, Height: height, Votes: make(map[string][]byte)}
+	return &QC{Epoch: 0, NodeID: nodeID, Height: height, Votes: make(map[string][]byte)}
+}
+
+// newQCEpoch returns a QC bound to the given epoch.
+func newQCEpoch(epoch uint64, nodeID string, height uint64) *QC {
+	return &QC{Epoch: epoch, NodeID: nodeID, Height: height, Votes: make(map[string][]byte)}
 }
 
 // genesisBlock returns the root block and its pre-certified QC. Every member

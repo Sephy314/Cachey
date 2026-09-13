@@ -76,6 +76,14 @@ func (l *link) SendBlock(_ context.Context, peer string, bm *BlockMsg) error {
 	return l.n.deliver(peer, func(r *Replica) { r.HandleBlock(bm) })
 }
 
+func (l *link) SendGetBlocks(_ context.Context, peer string, g *GetBlocks) error {
+	return l.n.deliver(peer, func(r *Replica) { r.HandleGetBlocks(g) })
+}
+
+func (l *link) SendBlockBatch(_ context.Context, peer string, bb *BlockBatch) error {
+	return l.n.deliver(peer, func(r *Replica) { r.HandleBlockBatch(bb) })
+}
+
 func (n *net) deliver(peer string, fn func(*Replica)) error {
 	n.mu.Lock()
 	dst := n.nodes[peer]
