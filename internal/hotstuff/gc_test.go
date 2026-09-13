@@ -1,7 +1,6 @@
 package hotstuff
 
 import (
-	"context"
 	"crypto/ed25519"
 	"fmt"
 	"testing"
@@ -374,7 +373,7 @@ func TestGCRestartRecovery(t *testing.T) {
 	if _, err := r2.Propose(nil); err != nil {
 		t.Fatal(err)
 	}
-	ctx := testCtx()
+	ctx := t.Context()
 	if err := r2.WaitCommitted(ctx, firstID); err != nil {
 		t.Fatalf("recovered block did not commit after GC restart: %v", err)
 	}
@@ -417,16 +416,10 @@ func TestGCCrashBeforeRotation(t *testing.T) {
 	if exec2 != cp.BExec {
 		t.Fatalf("recovery without checkpoint: exec=%q want %q", exec2, cp.BExec)
 	}
-	ctx := testCtx()
+	ctx := t.Context()
 	if err := r2.WaitCommitted(ctx, firstID); err != nil {
 		t.Fatalf("recovered block did not commit: %v", err)
 	}
-}
-
-// testCtx returns a bounded context for WaitCommitted.
-func testCtx() context.Context {
-	ctx, _ := context.WithTimeout(context.Background(), testTimeout)
-	return ctx
 }
 
 // openWALReplicaCP boots a WAL-backed replica that loads an engine checkpoint
