@@ -49,6 +49,8 @@ const (
 	kindViewChange = "ViewChange"
 	kindFetch      = "Fetch"
 	kindBlock      = "Block"
+	kindGetBlocks  = "GetBlocks"
+	kindBlockBatch = "BlockBatch"
 	kindHello      = "Hello"
 )
 
@@ -537,6 +539,18 @@ func (t *TCPTransport) dispatch(peer string, line []byte) error {
 			return err
 		}
 		node.HandleBlock(&m)
+	case kindGetBlocks:
+		var m GetBlocks
+		if err := json.Unmarshal(wm.Data, &m); err != nil {
+			return err
+		}
+		node.HandleGetBlocks(&m)
+	case kindBlockBatch:
+		var m BlockBatch
+		if err := json.Unmarshal(wm.Data, &m); err != nil {
+			return err
+		}
+		node.HandleBlockBatch(&m)
 	default:
 		return errors.New("hotstuff transport: unknown kind " + wm.Kind)
 	}
@@ -660,6 +674,12 @@ func (t *TCPTransport) peerConn(peer string) (*peerConn, error) {
 
 func (t *TCPTransport) SendProposal(_ context.Context, peer string, m *Proposal) error {
 	return t.send(peer, kindProposal, m)
+}
+func (t *TCPTransport) SendGetBlocks(_ context.Context, peer string, m *GetBlocks) error {
+	return t.send(peer, kindGetBlocks, m)
+}
+func (t *TCPTransport) SendBlockBatch(_ context.Context, peer string, m *BlockBatch) error {
+	return t.send(peer, kindBlockBatch, m)
 }
 func (t *TCPTransport) SendVote(_ context.Context, peer string, m *Vote) error {
 	return t.send(peer, kindVote, m)

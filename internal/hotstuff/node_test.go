@@ -74,6 +74,8 @@ type recorderTransport struct {
 	mu       sync.Mutex
 	votes    []Vote
 	fetchIDs []string
+	syncs    []GetBlocks
+	batches  []BlockBatch
 }
 
 func (r *recorderTransport) SendProposal(context.Context, string, *Proposal) error { return nil }
@@ -91,6 +93,18 @@ func (r *recorderTransport) SendFetch(_ context.Context, _ string, f *Fetch) err
 	return nil
 }
 func (r *recorderTransport) SendBlock(context.Context, string, *BlockMsg) error { return nil }
+func (r *recorderTransport) SendGetBlocks(_ context.Context, _ string, g *GetBlocks) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.syncs = append(r.syncs, *g)
+	return nil
+}
+func (r *recorderTransport) SendBlockBatch(_ context.Context, _ string, bb *BlockBatch) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.batches = append(r.batches, *bb)
+	return nil
+}
 
 func (r *recorderTransport) voteCount(nodeID string) int {
 	r.mu.Lock()
@@ -124,7 +138,12 @@ func newFollower() (*Replica, *recorderTransport) {
 // quorumQC returns a QC over nodeID at height h carrying 2f+1 valid signed
 // votes (f = 1) from the phantom members.
 func quorumQC(nodeID string, h uint64) *QC {
-	q := newQC(nodeID, h)
+	return quorumQCEpoch(0, nodeID, h)
+}
+
+// quorumQCEpoch is quorumQC with an explicit QC epoch.
+func quorumQCEpoch(epoch uint64, nodeID string, h uint64) *QC {
+	q := newQCEpoch(epoch, nodeID, h)
 	for _, v := range []string{testLeaderID, testPeer1, testPeer2} {
 		q.Votes[v] = signVote(v, h, nodeID).Sig
 	}

@@ -83,6 +83,11 @@ func (n *Replica) PublicKey() ed25519.PublicKey {
 // claim. Re-pinning the SAME key (a reconnect) is a no-op success. Unknown
 // members may still register (the membership check lives in the transport /
 // caller).
+//
+// Pinning a genesis member's key also records it in the epoch-0 ValidatorSet,
+// whose keys are the configured bootstrap keys (epoch-0 QCs/votes verify with
+// them). Later epochs' keys come from the membership command, not from here —
+// consensus membership and transport trust stay separate.
 func (n *Replica) SetPeerKey(peer string, pub ed25519.PublicKey) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -93,6 +98,9 @@ func (n *Replica) SetPeerKey(peer string, pub ed25519.PublicKey) bool {
 		return false // a different key is already pinned for this member
 	}
 	n.peerKeys[peer] = pub
+	if set := n.sets[0]; set != nil && set.has(peer) {
+		set.PublicKeys[peer] = pub
+	}
 	return true
 }
 
@@ -132,37 +140,47 @@ func (n *Replica) verify(sender string, sig []byte, m any) bool {
 }
 
 // qcValid reports whether qc is a genuine quorum certificate: either the
-// trusted genesis root (whose QC is hard-coded, per the paper) or at least
-// 2f+1 distinct members whose stored vote signatures all verify. Must hold
-// n.mu (reads peerKeys).
+// trusted genesis root (whose QC is hard-coded, per the paper) or at least a
+// quorum of distinct members of ValidatorSet(qc.Epoch) whose stored vote
+// signatures all verify. The epoch's set — not the replica's current
+// membership — decides voter membership, public keys, signatures and quorum,
+// so a QC from any past epoch remains verifiable after membership changes.
+// A QC whose epoch is unknown (no set for it) cannot be validated and is
+// rejected; the certified block itself may be unknown (it is fetched
+// separately — the votes are self-contained). Must hold n.mu (reads sets).
 func (n *Replica) qcValid(qc *QC) bool {
 	if qc == nil {
 		return false
 	}
 	if qc.NodeID == genesisID {
-		// Only the actual genesis root — the QC over genesis at height 0 — is
-		// trusted. A forged "genesis QC" claiming a higher height (or any votes
-		// that would certify something else) must not pass: an attacker could
-		// otherwise bootstrap a block with an absurd justification height and
-		// corrupt the replica's height bookkeeping.
-		return qc.Height == 0
+		// Only the actual genesis root — the QC over genesis at height 0 in
+		// epoch 0 — is trusted. A forged "genesis QC" claiming a higher height
+		// (or another epoch) must not pass: an attacker could otherwise
+		// bootstrap a block with an absurd justification height and corrupt
+		// the replica's height bookkeeping.
+		return qc.Height == 0 && qc.Epoch == 0
 	}
-	if len(qc.Votes) < 2*n.f+1 {
+	set := n.sets[qc.Epoch]
+	if set == nil {
+		return false // unknown epoch — cannot validate (reject, request history)
+	}
+	if len(qc.Votes) < set.Quorum {
 		return false
 	}
-	// A QC's height claim must agree with the block it certifies when that
-	// block is known. A QC carries no view of its own — the view is a property
-	// of the block it certifies, which the structural checks pin (`NodeID` must
-	// be the proposal's parent) — so a height disagreement is the remaining way
-	// a QC could describe something other than the block it names.
-	if b, ok := n.blocks[qc.NodeID]; ok && b.Height != qc.Height {
+	// A QC's height and epoch claims must agree with the block it certifies
+	// when that block is known. A QC carries no view of its own — the view is
+	// a property of the block it certifies, which the structural checks pin
+	// (`NodeID` must be the proposal's parent) — so a height or epoch
+	// disagreement is the remaining way a QC could describe something other
+	// than the block it names.
+	if b, ok := n.blocks[qc.NodeID]; ok && (b.Height != qc.Height || b.Epoch != qc.Epoch) {
 		return false
 	}
 	for voter, sig := range qc.Votes {
-		if !n.members[voter] {
+		if !set.has(voter) {
 			return false // a non-validator can never contribute to a quorum
 		}
-		pub, ok := n.peerKeys[voter]
+		pub, ok := set.PublicKeys[voter]
 		if !ok || len(pub) == 0 {
 			return false
 		}

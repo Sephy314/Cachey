@@ -258,6 +258,10 @@ func (n *Replica) finishRecoveryLocked() {
 		}
 		if gp := n.blocks[parent.Parent]; gp != nil && oneChainedBy(gp, parent) && gp.Height > exec.Height {
 			exec = gp
+			// A committed membership-transition block activates its epoch's
+			// validator set. QCs replay in raise order, so transitions activate
+			// in order and each derivation's base set already exists.
+			n.activateTransitionLocked(gp)
 		}
 	}
 	// The executed watermark is authoritative and may cover a commit whose QC

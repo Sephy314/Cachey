@@ -53,7 +53,7 @@ func (n *Replica) StartViewChange() {
 	}
 	if target != 0 && !n.vcSent[target] {
 		n.vcSent[target] = true
-		vc = &ViewChange{View: target, HighQC: n.qcHigh, From: n.id}
+		vc = &ViewChange{View: target, Epoch: n.epoch, HighQC: n.qcHigh, From: n.id}
 		vc.Sig = n.sign(vc)
 		sendTo = n.leader
 		if n.id == sendTo {
@@ -72,36 +72,58 @@ func (n *Replica) StartViewChange() {
 
 // enterViewLocked advances this replica into a strictly newer view (updating
 // the current leader and dropping leader activity — a leader only becomes
-// active again by gathering a quorum of view changes). Must hold n.mu.
+// active again by gathering a quorum of view changes). The leader is computed
+// for the current epoch. Must hold n.mu.
 func (n *Replica) enterViewLocked(view uint64) bool {
+	return n.enterViewLockedEpoch(view, n.epoch)
+}
+
+// enterViewLockedEpoch is enterViewLocked with an explicit epoch for the
+// leader computation: during a transition the block being processed may belong
+// to the next epoch, whose leader schedule differs. Must hold n.mu.
+func (n *Replica) enterViewLockedEpoch(view, epoch uint64) bool {
 	if view <= n.view {
 		return false
 	}
 	n.view = view
-	n.leader = n.leaderOf(view)
+	n.leader = n.leaderOfEpoch(epoch, view)
 	n.active = false
 	return true
 }
 
 // HandleViewChange records a peer's view change. Only the leader of the target
-// view counts them; once 2f+1 distinct members (including itself) have moved
-// to that view, it joins the view and activates, adopting the highest reported
-// QC as its base.
+// view counts them; once a quorum of distinct members of the CURRENT epoch
+// have moved to that view, it joins the view and activates, adopting the
+// highest reported QC as its base.
+//
+// A view change is only meaningful in the receiver's current epoch: a
+// stale-epoch vc (from before a transition) must not move the receiver, and a
+// future-epoch vc cannot be validated (its set is unknown). A lagging replica
+// catches up through proposals instead.
 func (n *Replica) HandleViewChange(vc *ViewChange) {
-	if vc == nil || !n.members[vc.From] || n.id != n.leaderOf(vc.View) {
+	if vc == nil {
 		return
 	}
 	var fetch *Fetch
 	n.mu.Lock()
-	if !n.verify(vc.From, vc.Sig, *vc) || vc.View < n.view {
+	if vc.Epoch != n.epoch {
+		n.mu.Unlock()
+		return // stale or future epoch — not for the current configuration
+	}
+	set := n.sets[n.epoch]
+	if set == nil || !set.has(vc.From) || n.id != n.leaderOfEpoch(n.epoch, vc.View) {
+		n.mu.Unlock()
+		return
+	}
+	if !n.verifyInSet(set, vc.From, vc.Sig, *vc) || vc.View < n.view {
 		n.mu.Unlock()
 		return // unauthenticated/tampered, or stale
 	}
 	// Count the view change, but NEVER advance to vc.View on a single (possibly
 	// Byzantine) message: a replica joins a higher view only once a quorum of
-	// 2f+1 members has moved to it (see maybeActivateLocked). Otherwise one
-	// signed ViewChange for a far-future view — whose leader this replica is —
-	// would strand it there, permanently out of reach of the real, lower views.
+	// members has moved to it (see maybeActivateLocked). Otherwise one signed
+	// ViewChange for a far-future view — whose leader this replica is — would
+	// strand it there, permanently out of reach of the real, lower views.
 	n.addVC(vc)
 	fetch = n.maybeActivateLocked(vc.View)
 	n.mu.Unlock()
@@ -111,30 +133,33 @@ func (n *Replica) HandleViewChange(vc *ViewChange) {
 }
 
 // addVC stores one member's view change for the target view. Must hold n.mu
-// and be the target view's leader.
+// and be the target view's leader in the current epoch.
 func (n *Replica) addVC(vc *ViewChange) {
-	if !n.members[vc.From] || n.id != n.leaderOf(vc.View) {
+	set := n.sets[n.epoch]
+	if set == nil || !set.has(vc.From) || n.id != n.leaderOfEpoch(n.epoch, vc.View) {
 		return
 	}
-	set := n.vcs[vc.View]
-	if set == nil {
-		set = make(map[string]*ViewChange)
-		n.vcs[vc.View] = set
+	setV := n.vcs[vc.View]
+	if setV == nil {
+		setV = make(map[string]*ViewChange)
+		n.vcs[vc.View] = setV
 	}
-	set[vc.From] = vc
+	setV[vc.From] = vc
 }
 
 // maybeActivateLocked activates this replica as the leader of view when it has
-// collected 2f+1 view changes for it, adopting the highest reported QC as the
-// new base. Joining the view itself is quorum-gated: a replica enters a higher
-// view only here, once a quorum has moved to it — never on a single message.
-// Returns a Fetch when the base block must first be pulled from a peer (the
-// leader has not seen it yet). Must hold n.mu.
+// collected a quorum of view changes for it (from the current epoch's
+// validator set), adopting the highest reported QC as the new base. Joining
+// the view itself is quorum-gated: a replica enters a higher view only here,
+// once a quorum has moved to it — never on a single message. Returns a Fetch
+// when the base block must first be pulled from a peer (the leader has not
+// seen it yet). Must hold n.mu.
 func (n *Replica) maybeActivateLocked(view uint64) *Fetch {
-	if n.id != n.leaderOf(view) {
+	set := n.sets[n.epoch]
+	if set == nil || n.id != n.leaderOfEpoch(n.epoch, view) {
 		return nil
 	}
-	if len(n.vcs[view]) < 2*n.f+1 {
+	if len(n.vcs[view]) < set.Quorum {
 		return nil // not a quorum yet — a minority can never move us to a view
 	}
 	// A quorum of members moved to view; only now is joining it safe. The
@@ -265,14 +290,20 @@ func (n *Replica) markFetchLocked(id string) {
 }
 
 // HandleFetch answers a peer's request for a block this replica holds, signing
-// the reply so the requester can authenticate it.
+// the reply so the requester can authenticate it. The requester must be a
+// validator of some known epoch (transport-level trust; the block itself is
+// validated by the requester).
 func (n *Replica) HandleFetch(f *Fetch) {
-	if f == nil || !n.members[f.From] {
+	if f == nil {
 		return
 	}
 	n.mu.Lock()
+	known := n.knownMemberLocked(f.From)
 	b := n.blocks[f.BlockID]
 	n.mu.Unlock()
+	if !known {
+		return
+	}
 	if b == nil {
 		return
 	}
@@ -291,15 +322,16 @@ func (n *Replica) HandleFetch(f *Fetch) {
 // genuine QC certifying its direct parent at a lower height). Both matter:
 // Justify is not covered by the content-derived block id, so an unsolicited or
 // unstaked block would let any member inject a fabricated block into the tree
-// and move the head.
+// and move the head. The block's epoch is checked at insertion (addBlockLocked
+// derives it from the ancestry).
 func (n *Replica) HandleBlock(bm *BlockMsg) {
-	if bm == nil || !n.members[bm.From] {
+	if bm == nil {
 		return
 	}
 	var kids []*Proposal
 	var needParent string
 	n.mu.Lock()
-	if !n.verify(bm.From, bm.Sig, *bm) {
+	if !n.knownMemberLocked(bm.From) || !n.verify(bm.From, bm.Sig, *bm) {
 		n.mu.Unlock()
 		return // unauthenticated block reply
 	}

@@ -31,8 +31,15 @@ type Vote struct {
 // branch (the highest reported QC) to resume proposing from. It is unicast to
 // leaderOf(View) (HS-M2; mirrors pbft's StartViewChange determinism) and is
 // signed by From (HS-M3).
+//
+// Epoch is the sender's configuration at the time of the view change. A
+// receiver counts a view change only for its own current epoch: a stale-epoch
+// vc (from before a transition) must not move the receiver, and a future-epoch
+// vc cannot be validated (its set is unknown). This keeps view changes
+// unambiguous across epoch boundaries.
 type ViewChange struct {
 	View   uint64 `json:"view"`
+	Epoch  uint64 `json:"epoch"`
 	HighQC *QC    `json:"high_qc"`
 	From   string `json:"from"`
 	Sig    []byte `json:"sig,omitempty"`
@@ -57,6 +64,35 @@ type BlockMsg struct {
 	Sig   []byte `json:"sig,omitempty"`
 }
 
+// GetBlocks asks a peer for the contiguous range of blocks on the branch of
+// Target, from the child of Anchor (a block the requester already holds) up to
+// Target inclusive. RequestID correlates the response; To names the peer the
+// request is addressed to and From the requester. The anchor anchors the
+// branch: the peer walks Target's ancestry and answers only if Anchor is on
+// it, so a batch can never silently reinterpret a block as belonging to
+// another branch.
+type GetBlocks struct {
+	RequestID uint64 `json:"request_id"`
+	Anchor    string `json:"anchor"`
+	Target    string `json:"target"`
+	To        string `json:"to"`
+	From      string `json:"from"`
+}
+
+// BlockBatch is the answer to a GetBlocks: the blocks on Target's branch
+// between Anchor's child and Target, parent-contiguous, signed by From so the
+// requester can authenticate the responder. The requester validates the whole
+// batch (content identity, parent continuity, epoch, QCs) before inserting
+// anything — a batch is never trusted as-is.
+type BlockBatch struct {
+	RequestID uint64  `json:"request_id"`
+	Anchor    string  `json:"anchor"`
+	Target    string  `json:"target"`
+	Blocks    []Block `json:"blocks"`
+	From      string  `json:"from"`
+	Sig       []byte  `json:"sig,omitempty"`
+}
+
 // Transport delivers hotstuff messages between replicas. It is deliberately a
 // tiny seam independent of the consensus core: a deterministic in-memory
 // transport drives the unit tests, and a TCP transport (a later milestone)
@@ -68,4 +104,6 @@ type Transport interface {
 	SendViewChange(ctx context.Context, peer string, vc *ViewChange) error
 	SendFetch(ctx context.Context, peer string, f *Fetch) error
 	SendBlock(ctx context.Context, peer string, b *BlockMsg) error
+	SendGetBlocks(ctx context.Context, peer string, g *GetBlocks) error
+	SendBlockBatch(ctx context.Context, peer string, bb *BlockBatch) error
 }

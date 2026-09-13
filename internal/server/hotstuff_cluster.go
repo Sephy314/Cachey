@@ -65,6 +65,9 @@ func NewHotStuffApply(fsm *store.CacheyStore) func(hotstuff.Block) {
 			log.Printf("hotstuff apply: bad command: %v", err)
 			return
 		}
+		if rec.Op == wal.OpMembership {
+			return // protocol command (epoch/validator-set change) — not FSM data
+		}
 		if err := fsm.ApplyRecord(rec); err != nil {
 			log.Printf("hotstuff apply: %v", err)
 		}

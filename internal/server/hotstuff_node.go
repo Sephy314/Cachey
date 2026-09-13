@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/Sephy314/Cachey/internal/hotstuff"
 	"github.com/Sephy314/Cachey/internal/store"
@@ -43,6 +44,10 @@ type HotStuffNode struct {
 	WAL    *wal.WAL
 	CS     *HotStuffClusterStore
 	HSAddr string // bound hotstuff RPC listen address (host:port)
+
+	// Phase 2.5 GC: the background compaction loop (nil when disabled).
+	gcStop chan struct{}
+	gcDone chan struct{}
 }
 
 // HotStuffNodeConfig configures OpenHotStuffNode.
@@ -67,6 +72,14 @@ type HotStuffNodeConfig struct {
 	TLSCA   []byte
 	TLSCert []byte
 	TLSKey  []byte
+
+	// GCThreshold is the number of shared-WAL records that trigger a
+	// compaction cycle (engine checkpoint + WAL rotation). Zero disables the
+	// background loop; GC() can still be called explicitly.
+	GCThreshold int64
+	// GCRetention is the number of committed blocks below bExec retained for
+	// near-behind catch-up serving (Phase 2.5 GC). Zero uses the default.
+	GCRetention uint64
 }
 
 // OpenHotStuffNode opens (or recovers) a persistent HotStuff node and returns
@@ -96,6 +109,7 @@ func OpenHotStuffNode(cfg HotStuffNodeConfig) (*HotStuffNode, error) {
 	var sharedWAL *wal.WAL
 	node, err := hotstuff.NewReplica(hotstuff.Config{
 		ID: cfg.ID, Peers: cfg.Peers, Leader: cfg.Leader, PrivateKey: priv,
+		GCRetention: cfg.GCRetention,
 	}, tr, newHSStoreApply(&sharedWAL, st))
 	if err != nil {
 		return nil, err
@@ -117,10 +131,21 @@ func OpenHotStuffNode(cfg HotStuffNodeConfig) (*HotStuffNode, error) {
 		tr.EnableTLS(cfg.TLSCA, cfg.TLSCert, cfg.TLSKey)
 	}
 
+	// 1.5. Engine checkpoint: restore the retained consensus state (blocks,
+	// qcHigh, watermark, validator sets) before the WAL replay, so records at
+	// or before the checkpoint are idempotently skipped. The checkpoint is
+	// written by GC() before the WAL is compacted; a crash before the rotation
+	// leaves the full WAL, which replays idempotently on top of it.
+	if cp, ok, err := loadHSCheckpoint(cfg.Dir); err != nil {
+		return nil, err
+	} else if ok {
+		node.LoadCheckpoint(cp)
+	}
+
 	// 2. Shared WAL recovery: store snapshot first, then every record — store
 	//    mutations into the FSM, engine records into the engine.
 	wcfg := wal.DefaultConfig(cfg.Dir)
-	wcfg.DisableRotation = true // no engine snapshot yet; rotation would truncate engine records
+	wcfg.DisableRotation = true // compaction is driven by GC() (checkpoint + Rotate), not the background manager
 	w, err := wal.Open(wcfg, wal.Hooks{
 		ApplySnapshot: st.ApplySnapshot,
 		ApplyRecord: func(rec wal.Record) error {
@@ -147,7 +172,7 @@ func OpenHotStuffNode(cfg HotStuffNodeConfig) (*HotStuffNode, error) {
 		return nil, err
 	}
 	tr.RegisterPeer(cfg.ID, bound) // advertise our own RPC address
-	return &HotStuffNode{
+	hn := &HotStuffNode{
 		ID:     cfg.ID,
 		Dir:    cfg.Dir,
 		Store:  st,
@@ -156,7 +181,11 @@ func OpenHotStuffNode(cfg HotStuffNodeConfig) (*HotStuffNode, error) {
 		WAL:    w,
 		CS:     NewHotStuffClusterStore(node, st),
 		HSAddr: bound,
-	}, nil
+	}
+	if cfg.GCThreshold > 0 {
+		hn.startGCLoop(cfg.GCThreshold)
+	}
+	return hn, nil
 }
 
 func validateHSValidatorKeys(cfg HotStuffNodeConfig, priv ed25519.PrivateKey) error {
@@ -176,12 +205,124 @@ func validateHSValidatorKeys(cfg HotStuffNodeConfig, priv ed25519.PrivateKey) er
 }
 
 // Close shuts the node's transport down and stops the replica's background
-// timers (the view-suspicion timer, when armed). The WAL is flushed by its
-// owner (call w.Close() explicitly before reopening the dir — tests and the
-// server do this; see wal_persist_test / raftnode usage).
+// timers (the view-suspicion timer, when armed) and the GC loop. The WAL is
+// flushed by its owner (call w.Close() explicitly before reopening the dir —
+// tests and the server do this; see wal_persist_test / raftnode usage).
 func (n *HotStuffNode) Close() {
+	if n.gcStop != nil {
+		close(n.gcStop)
+		<-n.gcDone
+		n.gcStop, n.gcDone = nil, nil
+	}
 	n.Tr.Close()
 	n.Node.Stop()
+}
+
+// GC compacts the node's storage: the engine computes the GC boundary and
+// returns a checkpoint of the retained state; the checkpoint is written
+// durably (temp + fsync + rename), then the shared WAL is rotated (store
+// snapshot + truncation). Crash-safe: the checkpoint is durable before any
+// deletion/truncation, and recovery is idempotent whether or not the rotation
+// completed.
+func (n *HotStuffNode) GC() error {
+	cp, deleted, err := n.Node.GC()
+	if err != nil {
+		return err
+	}
+	if !deleted {
+		return nil
+	}
+	if err := writeHSCheckpoint(n.Dir, cp); err != nil {
+		return err
+	}
+	return n.WAL.Rotate()
+}
+
+// startGCLoop runs compaction in the background: when the shared WAL grows
+// past threshold records, a compaction cycle (engine checkpoint + rotation)
+// is driven. The loop is stopped by Close.
+func (n *HotStuffNode) startGCLoop(threshold int64) {
+	n.gcStop = make(chan struct{})
+	n.gcDone = make(chan struct{})
+	go func() {
+		defer close(n.gcDone)
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if n.WAL.MetaCount() >= threshold {
+					if err := n.GC(); err != nil {
+						log.Printf("hotstuff node %s: GC: %v", n.ID, err)
+					}
+				}
+			case <-n.gcStop:
+				return
+			}
+		}
+	}()
+}
+
+// hsCheckpointName is the engine checkpoint file in the node's data dir.
+const hsCheckpointName = "hscheckpoint"
+
+// writeHSCheckpoint atomically persists the engine checkpoint: temp file +
+// fsync + rename + directory fsync. A crash before the rename leaves the old
+// checkpoint (or none) intact; the temp file is ignored on recovery.
+func writeHSCheckpoint(dir string, cp hotstuff.Checkpoint) error {
+	b, err := json.Marshal(cp)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	tmp := filepath.Join(dir, hsCheckpointName+".tmp")
+	final := filepath.Join(dir, hsCheckpointName)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
+
+// loadHSCheckpoint reads the engine checkpoint, reporting ok=false when none
+// exists (a fresh node or a crash before the first GC).
+func loadHSCheckpoint(dir string) (hotstuff.Checkpoint, bool, error) {
+	b, err := os.ReadFile(filepath.Join(dir, hsCheckpointName))
+	if os.IsNotExist(err) {
+		return hotstuff.Checkpoint{}, false, nil
+	}
+	if err != nil {
+		return hotstuff.Checkpoint{}, false, err
+	}
+	var cp hotstuff.Checkpoint
+	if err := json.Unmarshal(b, &cp); err != nil {
+		return hotstuff.Checkpoint{}, false, err
+	}
+	return cp, true, nil
+}
+
+// syncDir fsyncs a directory so renames/unlinks become durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // newHSStoreApply builds the durable apply hook for a persistent node. Unlike
@@ -204,6 +345,9 @@ func newHSStoreApply(wp **wal.WAL, fsm *store.CacheyStore) func(hotstuff.Block) 
 		if err := json.Unmarshal(b.Cmd, &rec); err != nil {
 			log.Printf("hotstuff apply: bad command: %v", err)
 			return
+		}
+		if rec.Op == wal.OpMembership {
+			return // protocol command (epoch/validator-set change) — not FSM data
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), hsProposeTimeout)
 		defer cancel()

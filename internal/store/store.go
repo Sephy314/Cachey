@@ -213,6 +213,9 @@ func (s *CacheyStore) ApplyRecord(rec wal.Record) error {
 		// Chained HotStuff consensus-log entry: handled by the HotStuff
 		// replica, not the store. Kept as a no-op so a WAL shared with a
 		// HotStuff replica recovers safely.
+	case wal.OpMembership:
+		// HotStuff membership-change command: handled by the HotStuff replica
+		// (epoch/validator-set activation), never applied to the store.
 	default:
 		return fmt.Errorf("wal: unknown op %q", rec.Op)
 	}
