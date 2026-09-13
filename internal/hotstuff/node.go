@@ -298,6 +298,18 @@ func (n *Replica) ValidateQC(qc *QC) bool {
 	return n.qcValid(qc)
 }
 
+// highestBlockHeightLocked returns the height of the tallest block in the
+// tree. Must hold n.mu.
+func (n *Replica) highestBlockHeightLocked() uint64 {
+	var maxH uint64
+	for _, b := range n.blocks {
+		if b.Height > maxH {
+			maxH = b.Height
+		}
+	}
+	return maxH
+}
+
 // Propose (leader only) creates the next block on the chain, carrying cmd (nil
 // for an empty block that keeps the chain advancing), records this replica's
 // own vote and broadcasts the proposal to its peers. It returns the new
@@ -337,6 +349,18 @@ func (n *Replica) proposeLocked(cmd []byte) *Proposal {
 		// correct replica voted in the previous view (see viewchange.go).
 		h = parent.Height + 2
 		n.freshBase = false
+	}
+	// After a restart, the tree may hold blocks ABOVE the head: blocks this
+	// leader proposed in a previous life whose QC never formed (the head is
+	// the highest QC, not the highest block). Proposing at head+1 would fork
+	// at a height the followers already voted for — their vote-once guard
+	// (vHeight) blocks the new vote, wedging the leader. Skip above the
+	// highest known block so the proposal is strictly above every height any
+	// correct replica could have voted for (height gaps are legal since
+	// HS-M2). In normal operation the tree's max height is the head, so this
+	// is a no-op.
+	if maxH := n.highestBlockHeightLocked(); h <= maxH {
+		h = maxH + 1
 	}
 	b := &Block{
 		View:    n.view,
