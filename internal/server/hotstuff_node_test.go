@@ -106,7 +106,10 @@ func TestHotStuffPersistentRestart(t *testing.T) {
 	base := t.TempDir()
 	ids := []string{"p0", "p1", "p2", "p3"}
 
-	// Life 1: write through the leader and converge.
+	// Life 1: write through the leader and converge. Both writes must be
+	// applied on every node before the cluster is closed — otherwise a node
+	// that missed k2's propagation would restart without it and the post-
+	// restart convergence check would time out.
 	nodes := bootPersistentCluster(t, ids, base)
 	leaderPub := nodes[ids[0]].Node.PublicKey()
 	lead := nodes[ids[0]].CS
@@ -117,6 +120,7 @@ func TestHotStuffPersistentRestart(t *testing.T) {
 		t.Fatalf("Put(k2): %v", err)
 	}
 	allFSMHas(t, nodes, "k", "v")
+	allFSMHas(t, nodes, "k2", "v2")
 	closePersistentCluster(nodes)
 
 	// Life 2: reopen from the same data dirs.

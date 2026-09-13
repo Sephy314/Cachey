@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +28,9 @@ const (
 // ErrBusy is returned when the writer cannot accept a mutation right now
 // (hold queue / temporary WAL full). Callers should retry.
 var ErrBusy = errors.New("wal: busy, retry later")
+
+// ErrClosed is returned by Append after the WAL has been closed.
+var ErrClosed = errors.New("wal: closed")
 
 // Op identifies the type of a WAL record.
 type Op string
@@ -192,6 +196,10 @@ type WAL struct {
 	writer    *Writer
 	manager   *Manager
 	closeOnce sync.Once
+	// closed is set before the writer stops. Append checks it so a caller that
+	// races Close (a message handler mid-dispatch on a replica being torn down)
+	// fails immediately instead of blocking on a channel nobody drains.
+	closed atomic.Bool
 }
 
 // Open runs recovery, starts the writer and manager goroutines, and returns a
@@ -245,8 +253,13 @@ func Open(cfg Config, hooks Hooks) (*WAL, error) {
 	}, nil
 }
 
-// Append writes rec to the WAL, waiting for durability.
+// Append writes rec to the WAL, waiting for durability. After Close it fails
+// immediately (the writer goroutine is gone; a buffered send would otherwise
+// block until the caller's context expires).
 func (w *WAL) Append(ctx context.Context, rec Record) error {
+	if w.closed.Load() {
+		return ErrClosed
+	}
 	return w.logger.Append(ctx, rec)
 }
 
@@ -259,14 +272,19 @@ func (w *WAL) MetaCount() int64 { return w.writer.MetaCount() }
 // to compact the shared WAL after the engine checkpoint is durable. Returns
 // the error instead of calling onFatal (unlike the background path).
 func (w *WAL) Rotate() error {
+	if w.closed.Load() {
+		return ErrClosed
+	}
 	return w.manager.Rotate()
 }
 
 // Close stops the manager and writer goroutines and closes open files. It is
-// idempotent: repeated calls are no-ops.
+// idempotent: repeated calls are no-ops. Once closed, Append fails with
+// ErrClosed so an in-flight caller cannot block on the dead writer.
 func (w *WAL) Close() error {
 	var err error
 	w.closeOnce.Do(func() {
+		w.closed.Store(true)
 		close(w.manager.stop)
 		<-w.manager.done
 		close(w.writer.stop)
